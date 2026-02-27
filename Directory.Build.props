@@ -1,0 +1,9 @@
+<Project>
+  <PropertyGroup>
+    <Authors>marmut-mdk contributors</Authors>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/DavidGershony/dotnet-mls</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>MLS;RFC9420;messaging;encryption;protocol</PackageTags>
+  </PropertyGroup>
+</Project>

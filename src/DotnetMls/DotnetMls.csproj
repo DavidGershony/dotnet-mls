@@ -4,11 +4,7 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <PackageId>DotnetMls</PackageId>
-    <Version>0.1.0-alpha.1</Version>
     <Description>Pure C# implementation of the MLS protocol (RFC 9420)</Description>
-    <Authors>marmut-mdk contributors</Authors>
-    <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <RepositoryUrl>https://github.com/DavidGershony/dotnet-mls</RepositoryUrl>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\DotnetMls.Crypto\DotnetMls.Crypto.csproj" />
