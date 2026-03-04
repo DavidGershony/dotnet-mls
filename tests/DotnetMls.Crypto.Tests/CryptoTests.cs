@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Text;
 using DotnetMls.Crypto;
 using Xunit;
 
@@ -625,5 +627,70 @@ public class CipherSuite0x0001Tests
         var r1 = cs.RandomBytes(32);
         var r2 = cs.RandomBytes(32);
         Assert.NotEqual(r1, r2);
+    }
+
+    // ---- RFC 9420 Section 5.1.2 VarInt encoding regression tests ----
+    // These tests reproduce the bug where BuildSignContent omitted VarInt length prefixes.
+    // They FAIL before the fix and PASS after.
+
+    [Fact]
+    public void SignWithLabel_UsesVarIntPrefixedEncoding()
+    {
+        // RFC 9420 §5.1.2: SignContent = VarInt(len(label)) || label || VarInt(len(content)) || content
+        // where label = "MLS 1.0 " + Label.
+        // We sign the CORRECTLY encoded bytes directly via Ed25519Provider, then assert
+        // that VerifyWithLabel (which calls BuildSignContent internally) accepts that signature.
+        // Before fix: VerifyWithLabel builds wrong bytes → verify fails.
+        // After fix:  VerifyWithLabel builds correct bytes → verify passes.
+
+        var signer = new Ed25519Provider();
+        var (privKey, pubKey) = signer.GenerateKeyPair();
+
+        var label = "LeafNodeTBS";
+        var content = new byte[] { 0x01, 0x02, 0x03, 0x04 };
+
+        // Build correct SignContent: VarInt(19) || "MLS 1.0 LeafNodeTBS" || VarInt(4) || content
+        var fullLabel = Encoding.UTF8.GetBytes("MLS 1.0 " + label); // 19 bytes, VarInt = 0x13
+        var correctSignContent = new byte[1 + fullLabel.Length + 1 + content.Length];
+        var offset = 0;
+        correctSignContent[offset++] = (byte)fullLabel.Length;  // VarInt(19) = 0x13
+        Buffer.BlockCopy(fullLabel, 0, correctSignContent, offset, fullLabel.Length);
+        offset += fullLabel.Length;
+        correctSignContent[offset++] = (byte)content.Length;    // VarInt(4) = 0x04
+        Buffer.BlockCopy(content, 0, correctSignContent, offset, content.Length);
+
+        // Sign the correctly-encoded bytes directly (bypasses BuildSignContent)
+        var correctSig = signer.Sign(privKey, correctSignContent);
+
+        // VerifyWithLabel must reconstruct the same correct encoding internally
+        var cs = new CipherSuite0x0001();
+        Assert.True(cs.VerifyWithLabel(pubKey, label, content, correctSig));
+    }
+
+    [Fact]
+    public void RefHash_UsesVarIntPrefixedEncoding()
+    {
+        // RFC 9420 §5.2: RefHashInput = VarInt(len(label)) || label || VarInt(len(value)) || value
+        // Before fix: label uses uint16 prefix, value has no prefix → wrong hash.
+        // After fix:  both fields use VarInt prefix → hash matches expected.
+
+        var cs = new CipherSuite0x0001();
+        var label = "MLS 1.0 KeyPackage";
+        var value = new byte[] { 0xAA, 0xBB, 0xCC, 0xDD };
+
+        // Build correct RefHashInput: VarInt(len(label)) || label || VarInt(len(value)) || value
+        var labelBytes = Encoding.UTF8.GetBytes(label); // 18 bytes, VarInt = 0x12
+        var correctInput = new byte[1 + labelBytes.Length + 1 + value.Length];
+        var offset = 0;
+        correctInput[offset++] = (byte)labelBytes.Length;  // VarInt(18) = 0x12
+        Buffer.BlockCopy(labelBytes, 0, correctInput, offset, labelBytes.Length);
+        offset += labelBytes.Length;
+        correctInput[offset++] = (byte)value.Length;       // VarInt(4) = 0x04
+        Buffer.BlockCopy(value, 0, correctInput, offset, value.Length);
+
+        var expectedHash = SHA256.HashData(correctInput);
+
+        // RefHash must produce SHA256(correctInput)
+        Assert.Equal(expectedHash, cs.RefHash(label, value));
     }
 }

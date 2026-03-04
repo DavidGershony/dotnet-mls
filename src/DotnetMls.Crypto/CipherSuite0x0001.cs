@@ -144,33 +144,29 @@ public sealed class CipherSuite0x0001 : ICipherSuite
     /// <remarks>
     /// Per RFC 9420 Section 5.2:
     ///   RefHash(label, value) = Hash(RefHashInput)
-    ///   where RefHashInput is:
     ///   struct {
-    ///     opaque label&lt;V&gt; = label;
-    ///     opaque value&lt;V&gt; = value;
+    ///     opaque label&lt;V&gt;;
+    ///     opaque value&lt;V&gt;;
     ///   } RefHashInput;
-    ///   Encoded as: uint16(label_len) || label || value
-    ///
-    ///   Note: The "value" field uses a variable-length encoding with a length prefix
-    ///   that matches the TLS encoding. For simplicity and per the spec's intent,
-    ///   we encode: uint16(label.Length) || label_bytes || value.
+    ///   Encoded as: VarInt(label_len) || label || VarInt(value_len) || value
     /// </remarks>
     public byte[] RefHash(string label, byte[] content)
     {
         var labelBytes = Encoding.UTF8.GetBytes(label);
 
-        // RefHashInput = uint16(label_len) || label || content
-        // Note: per the RFC, the value is included directly after the label
-        var input = new byte[2 + labelBytes.Length + content.Length];
+        // RefHashInput = VarInt(label_len) || label || VarInt(value_len) || value
+        var labelLenBytes = EncodeVarInt(labelBytes.Length);
+        var contentLenBytes = EncodeVarInt(content.Length);
+
+        var input = new byte[labelLenBytes.Length + labelBytes.Length + contentLenBytes.Length + content.Length];
         var offset = 0;
 
-        // uint16 label length (big-endian)
-        input[offset++] = (byte)(labelBytes.Length >> 8);
-        input[offset++] = (byte)(labelBytes.Length & 0xFF);
-
+        Buffer.BlockCopy(labelLenBytes, 0, input, offset, labelLenBytes.Length);
+        offset += labelLenBytes.Length;
         Buffer.BlockCopy(labelBytes, 0, input, offset, labelBytes.Length);
         offset += labelBytes.Length;
-
+        Buffer.BlockCopy(contentLenBytes, 0, input, offset, contentLenBytes.Length);
+        offset += contentLenBytes.Length;
         Buffer.BlockCopy(content, 0, input, offset, content.Length);
 
         return Hash(input);
@@ -195,16 +191,12 @@ public sealed class CipherSuite0x0001 : ICipherSuite
     /// <inheritdoc />
     /// <remarks>
     /// Per RFC 9420 Section 5.1.2:
-    ///   SignWithLabel(SignKey, Label, Content) =
-    ///     Sign(SignKey, SignContent)
-    ///   where SignContent is:
+    ///   SignWithLabel(SignKey, Label, Content) = Sign(SignKey, SignContent)
     ///   struct {
-    ///     opaque label&lt;7..255&gt; = "MLS 1.0 " + Label;
-    ///     opaque content&lt;0..2^32-1&gt; = Content;
+    ///     opaque label&lt;V&gt; = "MLS 1.0 " + Label;
+    ///     opaque content&lt;V&gt; = Content;
     ///   } SignContent;
-    ///
-    ///   For signing, we construct: "MLS 1.0 " || Label || Content
-    ///   and sign that directly with Ed25519.
+    ///   Encoded as: VarInt(label_len) || "MLS 1.0 " || Label || VarInt(content_len) || Content
     /// </remarks>
     public byte[] SignWithLabel(byte[] privateKey, string label, byte[] content)
     {
@@ -270,23 +262,50 @@ public sealed class CipherSuite0x0001 : ICipherSuite
     // ---- Private helpers ----
 
     /// <summary>
-    /// Builds the SignContent for SignWithLabel/VerifyWithLabel:
-    /// "MLS 1.0 " || label || content
+    /// Builds the SignContent for SignWithLabel/VerifyWithLabel per RFC 9420 §5.1.2:
+    /// VarInt(len("MLS 1.0 " + label)) || "MLS 1.0 " || label || VarInt(len(content)) || content
     /// </summary>
     private static byte[] BuildSignContent(string label, byte[] content)
     {
         var labelBytes = Encoding.UTF8.GetBytes(label);
-        var result = new byte[MlsLabelPrefix.Length + labelBytes.Length + content.Length];
+        var fullLabel = new byte[MlsLabelPrefix.Length + labelBytes.Length];
+        Buffer.BlockCopy(MlsLabelPrefix, 0, fullLabel, 0, MlsLabelPrefix.Length);
+        Buffer.BlockCopy(labelBytes, 0, fullLabel, MlsLabelPrefix.Length, labelBytes.Length);
+
+        var fullLabelLen = EncodeVarInt(fullLabel.Length);
+        var contentLen = EncodeVarInt(content.Length);
+
+        var result = new byte[fullLabelLen.Length + fullLabel.Length + contentLen.Length + content.Length];
         var offset = 0;
 
-        Buffer.BlockCopy(MlsLabelPrefix, 0, result, offset, MlsLabelPrefix.Length);
-        offset += MlsLabelPrefix.Length;
-
-        Buffer.BlockCopy(labelBytes, 0, result, offset, labelBytes.Length);
-        offset += labelBytes.Length;
-
+        Buffer.BlockCopy(fullLabelLen, 0, result, offset, fullLabelLen.Length);
+        offset += fullLabelLen.Length;
+        Buffer.BlockCopy(fullLabel, 0, result, offset, fullLabel.Length);
+        offset += fullLabel.Length;
+        Buffer.BlockCopy(contentLen, 0, result, offset, contentLen.Length);
+        offset += contentLen.Length;
         Buffer.BlockCopy(content, 0, result, offset, content.Length);
 
         return result;
+    }
+
+    /// <summary>
+    /// Encodes an integer as a QUIC-style VarInt (RFC 9000 §16).
+    /// </summary>
+    private static byte[] EncodeVarInt(int length)
+    {
+        if (length <= 63)
+            return new byte[] { (byte)length };
+        if (length <= 16383)
+            return new byte[] { (byte)(0x40 | (length >> 8)), (byte)(length & 0xFF) };
+        if (length <= 1073741823)
+            return new byte[]
+            {
+                (byte)(0x80 | (length >> 24)),
+                (byte)((length >> 16) & 0xFF),
+                (byte)((length >> 8) & 0xFF),
+                (byte)(length & 0xFF)
+            };
+        throw new ArgumentOutOfRangeException(nameof(length), length, "VarInt length exceeds maximum (2^30 - 1).");
     }
 }

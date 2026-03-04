@@ -76,7 +76,7 @@ public interface ICipherSuite
 
     /// <summary>
     /// MLS RefHash (RFC 9420 Section 5.2):
-    /// Hash(uint16(label_len) || label_bytes || value).
+    /// Hash(VarInt(label_len) || label || VarInt(value_len) || value).
     /// </summary>
     byte[] RefHash(string label, byte[] content);
 
@@ -95,12 +95,14 @@ public interface ICipherSuite
     // ---- Signatures ----
 
     /// <summary>
-    /// Signs content with an MLS label prefix: sign("MLS 1.0 " + label + content).
+    /// Signs content per RFC 9420 §5.1.2:
+    /// Sign(VarInt(label_len) || "MLS 1.0 " + label || VarInt(content_len) || content).
     /// </summary>
     byte[] SignWithLabel(byte[] privateKey, string label, byte[] content);
 
     /// <summary>
-    /// Verifies a signature with an MLS label prefix: verify("MLS 1.0 " + label + content).
+    /// Verifies a signature per RFC 9420 §5.1.2:
+    /// Verify(VarInt(label_len) || "MLS 1.0 " + label || VarInt(content_len) || content, sig).
     /// </summary>
     bool VerifyWithLabel(byte[] publicKey, string label, byte[] content, byte[] signature);
 
