@@ -705,6 +705,90 @@ public class RatchetTreeTests
         tree.AddLeaf(MakeLeaf(1));
         Assert.False(tree.IsBlank(0));
     }
+
+    /// <summary>
+    /// RFC 9420 §12.4.3.3: ratchet_tree serialization uses position-based node type
+    /// (even index = leaf, odd index = parent), with NO explicit nodeType discriminator byte.
+    /// The wire format for each node should be: uint8(present), then if present, directly
+    /// the LeafNode or ParentNode TLS encoding (determined by position).
+    /// </summary>
+    [Fact]
+    public void RatchetTree_Serialization_NoNodeTypeDiscriminator()
+    {
+        var tree = new RatchetTree();
+        tree.AddLeaf(MakeLeaf(1));
+        tree.AddLeaf(MakeLeaf(2));
+        // Tree has 3 nodes: leaf(0), parent(1-blank), leaf(2)
+
+        // Serialize
+        var data = TlsCodec.Serialize(w => tree.WriteTo(w));
+        var outerReader = new TlsReader(data);
+        var treeBytes = outerReader.ReadOpaqueV();
+        var sub = new TlsReader(treeBytes);
+
+        // Build the expected format manually (position-based, no nodeType byte):
+        // Node 0 (leaf, present): [1][LeafNode bytes]
+        // Node 1 (parent, blank): [0]
+        // Node 2 (leaf, present): [1][LeafNode bytes]
+
+        byte[] expectedLeaf0Bytes = TlsCodec.Serialize(w => MakeLeaf(1).WriteTo(w));
+        byte[] expectedLeaf2Bytes = TlsCodec.Serialize(w => MakeLeaf(2).WriteTo(w));
+
+        // Node 0: present leaf
+        Assert.Equal(1, sub.ReadUint8()); // present
+        byte[] actualLeaf0 = sub.ReadBytes(expectedLeaf0Bytes.Length);
+        Assert.Equal(expectedLeaf0Bytes, actualLeaf0);
+
+        // Node 1: blank parent
+        Assert.Equal(0, sub.ReadUint8()); // absent
+
+        // Node 2: present leaf
+        Assert.Equal(1, sub.ReadUint8()); // present
+        byte[] actualLeaf2 = sub.ReadBytes(expectedLeaf2Bytes.Length);
+        Assert.Equal(expectedLeaf2Bytes, actualLeaf2);
+
+        Assert.True(sub.IsEmpty);
+    }
+
+    /// <summary>
+    /// Verifies that a ratchet tree encoded in RFC-compliant format (no nodeType byte)
+    /// can be correctly deserialized by ReadFrom.
+    /// </summary>
+    [Fact]
+    public void RatchetTree_ReadFrom_RfcCompliantFormat_RoundTrips()
+    {
+        // Build the RFC-compliant wire format manually (no nodeType discriminator)
+        var leaf1 = MakeLeaf(1);
+        var leaf2 = MakeLeaf(2);
+
+        byte[] rfcTreeBytes = TlsCodec.Serialize(outerWriter =>
+        {
+            outerWriter.WriteVectorV(inner =>
+            {
+                // Node 0 (even = leaf): present + LeafNode
+                inner.WriteUint8(1);
+                leaf1.WriteTo(inner);
+
+                // Node 1 (odd = parent): blank
+                inner.WriteUint8(0);
+
+                // Node 2 (even = leaf): present + LeafNode
+                inner.WriteUint8(1);
+                leaf2.WriteTo(inner);
+            });
+        });
+
+        var reader = new TlsReader(rfcTreeBytes);
+        var tree = RatchetTree.ReadFrom(reader);
+
+        Assert.Equal(3, tree.NodeCount);
+        Assert.Equal(2u, tree.LeafCount);
+        Assert.NotNull(tree.GetLeaf(0));
+        Assert.Equal(new byte[] { 1 }, tree.GetLeaf(0)!.EncryptionKey);
+        Assert.NotNull(tree.GetLeaf(1));
+        Assert.Equal(new byte[] { 2 }, tree.GetLeaf(1)!.EncryptionKey);
+        Assert.True(tree.IsBlank(1)); // parent is blank
+    }
 }
 
 // ================================================================
@@ -850,6 +934,80 @@ public class KeyScheduleEpochTests
         var e1 = epoch.DeriveExporterSecret(cs, "label_a", context, 32);
         var e2 = epoch.DeriveExporterSecret(cs, "label_b", context, 32);
         Assert.NotEqual(e1, e2);
+    }
+
+    /// <summary>
+    /// RFC 9420 §8 requires welcome_secret to be derived from an intermediate secret,
+    /// NOT directly from joiner_secret:
+    ///   intermediate = KDF.Extract(salt=joiner_secret, ikm=psk_secret)
+    ///   welcome_secret = DeriveSecret(intermediate, "welcome")
+    ///   epoch_secret = ExpandWithLabel(intermediate, "epoch", GroupContext, Nh)
+    /// </summary>
+    [Fact]
+    public void WelcomeSecret_IsDerivedViaIntermediateSecret_PerRfc9420()
+    {
+        var cs = new CipherSuite0x0001();
+        var initSecret = new byte[32];
+        var commitSecret = new byte[32];
+        var groupContext = new byte[64];
+
+        var epoch = KeyScheduleEpoch.Create(cs, initSecret, commitSecret, groupContext);
+
+        // Per RFC 9420 §8:
+        // intermediate_secret = KDF.Extract(salt=joiner_secret, ikm=psk_secret)
+        // When no PSKs, psk_secret = zeros(Nh)
+        byte[] pskSecret = new byte[cs.SecretSize];
+        byte[] intermediateSecret = cs.Extract(epoch.JoinerSecret, pskSecret);
+
+        // welcome_secret = DeriveSecret(intermediate_secret, "welcome")
+        byte[] expectedWelcomeSecret = cs.DeriveSecret(intermediateSecret, "welcome");
+
+        Assert.Equal(expectedWelcomeSecret, epoch.WelcomeSecret);
+    }
+
+    /// <summary>
+    /// Same RFC 9420 §8 check for FromJoinerSecret path (used in Welcome processing).
+    /// </summary>
+    [Fact]
+    public void FromJoinerSecret_WelcomeSecret_IsDerivedViaIntermediateSecret()
+    {
+        var cs = new CipherSuite0x0001();
+        var joinerSecret = cs.RandomBytes(32);
+        var groupContext = new byte[64];
+
+        var epoch = KeyScheduleEpoch.FromJoinerSecret(cs, joinerSecret, groupContext);
+
+        byte[] pskSecret = new byte[cs.SecretSize];
+        byte[] intermediateSecret = cs.Extract(joinerSecret, pskSecret);
+        byte[] expectedWelcomeSecret = cs.DeriveSecret(intermediateSecret, "welcome");
+
+        Assert.Equal(expectedWelcomeSecret, epoch.WelcomeSecret);
+    }
+
+    /// <summary>
+    /// RFC 9420 §8 requires epoch_secret to be derived from intermediate_secret, not member:
+    ///   epoch_secret = ExpandWithLabel(intermediate, "epoch", GroupContext, Nh)
+    /// </summary>
+    [Fact]
+    public void EpochSecret_IsDerivedViaIntermediateSecret_PerRfc9420()
+    {
+        var cs = new CipherSuite0x0001();
+        var initSecret = new byte[32];
+        var commitSecret = new byte[32];
+        var groupContext = new byte[64];
+
+        var epoch = KeyScheduleEpoch.Create(cs, initSecret, commitSecret, groupContext);
+
+        // Compute expected epoch_secret per RFC 9420:
+        byte[] pskSecret = new byte[cs.SecretSize];
+        byte[] intermediateSecret = cs.Extract(epoch.JoinerSecret, pskSecret);
+        byte[] expectedEpochSecret = cs.ExpandWithLabel(
+            intermediateSecret, "epoch", groupContext, cs.SecretSize);
+
+        // Verify by checking a derived secret (confirmation_key = DeriveSecret(epoch_secret, "confirm"))
+        byte[] expectedConfirmationKey = cs.DeriveSecret(expectedEpochSecret, "confirm");
+
+        Assert.Equal(expectedConfirmationKey, epoch.ConfirmationKey);
     }
 }
 

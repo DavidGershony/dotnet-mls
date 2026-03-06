@@ -418,8 +418,10 @@ public sealed class RatchetTree
     /// <summary>
     /// Serializes the entire ratchet tree for inclusion in Welcome messages.
     ///
-    /// TLS encoding: vector32 of optional&lt;Node&gt;
-    /// Each entry: uint8(present=1/0), if present: uint8(type: leaf=1/parent=2) + serialized node
+    /// TLS encoding per RFC 9420 §12.4.3.3: vector of optional&lt;Node&gt;.
+    /// Node type (leaf vs parent) is determined by position (even=leaf, odd=parent),
+    /// with NO explicit nodeType discriminator byte.
+    /// Each entry: uint8(present=1/0), if present: serialized LeafNode or ParentNode.
     /// </summary>
     public void WriteTo(TlsWriter writer)
     {
@@ -440,7 +442,6 @@ public sealed class RatchetTree
                     else
                     {
                         inner.WriteUint8(1); // present
-                        inner.WriteUint8(1); // leaf type
                         leaf.Value.WriteTo(inner);
                     }
                 }
@@ -453,7 +454,6 @@ public sealed class RatchetTree
                     else
                     {
                         inner.WriteUint8(1); // present
-                        inner.WriteUint8(2); // parent type
                         parent.Value.WriteTo(inner);
                     }
                 }
@@ -488,22 +488,17 @@ public sealed class RatchetTree
             }
             else
             {
-                byte nodeType = sub.ReadUint8();
-                if (nodeType == 1)
+                // Present node - type determined by position, NOT by a discriminator byte
+                // Per RFC 9420 §12.4.3.3: even positions are leaves, odd are parents
+                if (TreeMath.IsLeaf(nodeIndex))
                 {
-                    // Leaf node
                     var leafNode = LeafNode.ReadFrom(sub);
                     tree._nodes.Add(new TreeNode.Leaf(leafNode));
                 }
-                else if (nodeType == 2)
-                {
-                    // Parent node
-                    var parentNode = ParentNode.ReadFrom(sub);
-                    tree._nodes.Add(new TreeNode.Parent(parentNode));
-                }
                 else
                 {
-                    throw new TlsDecodingException($"Unknown tree node type: {nodeType}");
+                    var parentNode = ParentNode.ReadFrom(sub);
+                    tree._nodes.Add(new TreeNode.Parent(parentNode));
                 }
             }
 

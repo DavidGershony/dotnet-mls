@@ -165,7 +165,8 @@ public sealed class MlsGroup
         byte[] signingPrivateKey,
         byte[] signingPublicKey,
         out byte[] initPrivateKey,
-        out byte[] hpkePrivateKey)
+        out byte[] hpkePrivateKey,
+        ushort[]? supportedExtensionTypes = null)
     {
         // Generate init key pair (one-time use for Welcome)
         var (initPriv, initPub) = cs.GenerateHpkeKeyPair();
@@ -175,12 +176,16 @@ public sealed class MlsGroup
         var (hpkePriv, hpkePub) = cs.GenerateHpkeKeyPair();
         hpkePrivateKey = hpkePriv;
 
+        var capabilities = CreateDefaultCapabilities(cs);
+        if (supportedExtensionTypes is { Length: > 0 })
+            capabilities.Extensions = supportedExtensionTypes;
+
         var leafNode = new LeafNode
         {
             EncryptionKey = hpkePub,
             SignatureKey = signingPublicKey,
             Credential = new BasicCredential(identity),
-            Capabilities = CreateDefaultCapabilities(cs),
+            Capabilities = capabilities,
             Source = LeafNodeSource.KeyPackage,
             Lifetime = new Lifetime(0, ulong.MaxValue),
             Extensions = Array.Empty<Extension>()
@@ -614,20 +619,22 @@ public sealed class MlsGroup
             throw new InvalidOperationException(
                 "Welcome does not contain secrets for our key package.");
 
-        // Decrypt the group secrets using our init key
+        // Decrypt the group secrets using our init key (EncryptWithLabel per RFC 9420 §5.1.3)
+        byte[] hpkeInfo = BuildEncryptContext("Welcome", welcome.EncryptedGroupInfo);
         byte[] groupSecretsBytes = cs.HpkeOpen(
             myInitPrivateKey,
             mySecrets.EncryptedGroupSecretsValue.KemOutput,
-            Array.Empty<byte>(), // info
+            hpkeInfo,
             Array.Empty<byte>(), // aad
             mySecrets.EncryptedGroupSecretsValue.Ciphertext);
 
         var gsReader = new TlsReader(groupSecretsBytes);
         var groupSecrets = GroupSecrets.ReadFrom(gsReader);
 
-        // Derive the welcome key and nonce from joiner_secret
-        byte[] welcomeSecret = cs.ExpandWithLabel(
-            groupSecrets.JoinerSecret, "welcome", Array.Empty<byte>(), cs.SecretSize);
+        // Derive welcome_secret via intermediate_secret per RFC 9420 §8
+        byte[] pskSecret = new byte[cs.SecretSize]; // zeros(Nh) when no PSKs
+        byte[] intermediateSecret = cs.Extract(groupSecrets.JoinerSecret, pskSecret);
+        byte[] welcomeSecret = cs.DeriveSecret(intermediateSecret, "welcome");
         byte[] welcomeKey = cs.ExpandWithLabel(
             welcomeSecret, "key", Array.Empty<byte>(), cs.AeadKeySize);
         byte[] welcomeNonce = cs.ExpandWithLabel(
@@ -867,10 +874,11 @@ public sealed class MlsGroup
 
             byte[] gsBytes = TlsCodec.Serialize(writer => groupSecrets.WriteTo(writer));
 
-            // HPKE encrypt to the new member's init key
+            // HPKE EncryptWithLabel to the new member's init key (RFC 9420 §5.1.3)
             // HpkeSeal returns kem_output || ciphertext concatenated
+            byte[] hpkeInfo = BuildEncryptContext("Welcome", encryptedGroupInfo);
             byte[] sealed_ = _cs.HpkeSeal(
-                initKey, Array.Empty<byte>(), Array.Empty<byte>(), gsBytes);
+                initKey, hpkeInfo, Array.Empty<byte>(), gsBytes);
 
             // Split the sealed bytes into KEM output and ciphertext
             // For X25519, KEM output is 32 bytes
@@ -987,6 +995,21 @@ public sealed class MlsGroup
     }
 
     // ---- Helper: Concatenate byte arrays ----
+
+    /// <summary>
+    /// Builds the EncryptContext info for EncryptWithLabel (RFC 9420 §5.1.3):
+    ///   struct { opaque label&lt;V&gt;; opaque content&lt;V&gt;; } EncryptContext;
+    ///   label = "MLS 1.0 " + Label
+    /// </summary>
+    private static byte[] BuildEncryptContext(string label, byte[] content)
+    {
+        return TlsCodec.Serialize(writer =>
+        {
+            byte[] fullLabel = System.Text.Encoding.ASCII.GetBytes("MLS 1.0 " + label);
+            writer.WriteOpaqueV(fullLabel);
+            writer.WriteOpaqueV(content);
+        });
+    }
 
     private static byte[] Concat(byte[] a, byte[] b)
     {

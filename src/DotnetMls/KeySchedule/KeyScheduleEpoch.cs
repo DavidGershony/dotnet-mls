@@ -119,13 +119,13 @@ public sealed class KeyScheduleEpoch
     /// Creates the key schedule for an epoch. This handles both initial group creation
     /// and subsequent epoch transitions after a Commit.
     /// <para>
-    /// Per RFC 9420 Section 8.1, the derivation is:
+    /// Per RFC 9420 Section 8, the derivation is:
     /// <code>
-    ///   pre_joiner    = ExpandWithLabel(init_secret, "joiner", GroupContext, Nh)
-    ///   joiner_secret = Extract(pre_joiner, commit_secret)
-    ///   welcome_secret = ExpandWithLabel(joiner_secret, "welcome", "", Nh)
-    ///   member         = ExpandWithLabel(joiner_secret, "member", "", Nh)
-    ///   epoch_secret   = Extract(member, psk_secret)
+    ///   pre_joiner         = ExpandWithLabel(init_secret, "joiner", GroupContext, Nh)
+    ///   joiner_secret      = Extract(pre_joiner, commit_secret)
+    ///   intermediate_secret = Extract(joiner_secret, psk_secret)
+    ///   welcome_secret     = DeriveSecret(intermediate_secret, "welcome")
+    ///   epoch_secret       = ExpandWithLabel(intermediate_secret, "epoch", GroupContext, Nh)
     /// </code>
     /// Then from epoch_secret all per-epoch secrets are derived using DeriveSecret.
     /// </para>
@@ -163,24 +163,17 @@ public sealed class KeyScheduleEpoch
         // joiner_secret = Extract(pre_joiner, commit_secret)
         var joinerSecret = cs.Extract(preJoiner, commitSecret);
 
-        // Step 2: Derive welcome_secret from joiner_secret
-        // welcome_secret = ExpandWithLabel(joiner_secret, "welcome", "", Nh)
-        var welcomeSecret = cs.ExpandWithLabel(joinerSecret, "welcome", Array.Empty<byte>(), nh);
+        // Step 2: intermediate_secret = KDF.Extract(salt=joiner_secret, ikm=psk_secret)
+        // psk_secret defaults to zeros(KDF.Nh) when no PSKs
+        var effectivePskSecret = pskSecret ?? new byte[nh];
+        if (effectivePskSecret.Length == 0) effectivePskSecret = new byte[nh];
+        var intermediateSecret = cs.Extract(joinerSecret, effectivePskSecret);
 
-        // Step 3: Derive member from joiner_secret
-        // member = ExpandWithLabel(joiner_secret, "member", "", Nh)
-        var member = cs.ExpandWithLabel(joinerSecret, "member", Array.Empty<byte>(), nh);
+        // Step 3: welcome_secret = DeriveSecret(intermediate_secret, "welcome")
+        var welcomeSecret = cs.DeriveSecret(intermediateSecret, "welcome");
 
-        // Step 4: Compute psk_secret (default = Extract(zeros, zeros) per RFC 9420 Section 8.4)
-        var effectivePskSecret = pskSecret;
-        if (effectivePskSecret == null || effectivePskSecret.Length == 0)
-        {
-            var zeros = new byte[nh];
-            effectivePskSecret = cs.Extract(zeros, zeros);
-        }
-
-        // Step 5: epoch_secret = Extract(member, psk_secret)
-        var epochSecret = cs.Extract(member, effectivePskSecret);
+        // Step 4: epoch_secret = ExpandWithLabel(intermediate_secret, "epoch", GroupContext, Nh)
+        var epochSecret = cs.ExpandWithLabel(intermediateSecret, "epoch", groupContext, nh);
 
         // Step 6: Derive all per-epoch secrets from epoch_secret
         // DeriveSecret(S, L) = ExpandWithLabel(S, L, "", Nh)
@@ -263,11 +256,11 @@ public sealed class KeyScheduleEpoch
     /// This is used during Welcome processing, where the joiner secret is provided
     /// directly in the GroupSecrets rather than being derived from init_secret and commit_secret.
     /// <para>
-    /// Per RFC 9420 Section 8.1, from the joiner_secret:
+    /// Per RFC 9420 Section 8, from the joiner_secret:
     /// <code>
-    ///   welcome_secret = ExpandWithLabel(joiner_secret, "welcome", "", Nh)
-    ///   member         = ExpandWithLabel(joiner_secret, "member", "", Nh)
-    ///   epoch_secret   = Extract(member, psk_secret)
+    ///   intermediate_secret = Extract(joiner_secret, psk_secret)
+    ///   welcome_secret     = DeriveSecret(intermediate_secret, "welcome")
+    ///   epoch_secret       = ExpandWithLabel(intermediate_secret, "epoch", GroupContext, Nh)
     /// </code>
     /// Then from epoch_secret all per-epoch secrets are derived using DeriveSecret.
     /// </para>
@@ -285,22 +278,16 @@ public sealed class KeyScheduleEpoch
     {
         var nh = cs.SecretSize;
 
-        // Step 1: Derive welcome_secret from joiner_secret
-        var welcomeSecret = cs.ExpandWithLabel(joinerSecret, "welcome", Array.Empty<byte>(), nh);
+        // Step 1: intermediate_secret = KDF.Extract(salt=joiner_secret, ikm=psk_secret)
+        var effectivePskSecret = pskSecret ?? new byte[nh];
+        if (effectivePskSecret.Length == 0) effectivePskSecret = new byte[nh];
+        var intermediateSecret = cs.Extract(joinerSecret, effectivePskSecret);
 
-        // Step 2: Derive member from joiner_secret
-        var member = cs.ExpandWithLabel(joinerSecret, "member", Array.Empty<byte>(), nh);
+        // Step 2: welcome_secret = DeriveSecret(intermediate_secret, "welcome")
+        var welcomeSecret = cs.DeriveSecret(intermediateSecret, "welcome");
 
-        // Step 3: Compute psk_secret (default = Extract(zeros, zeros) per RFC 9420 Section 8.4)
-        var effectivePskSecret = pskSecret;
-        if (effectivePskSecret == null || effectivePskSecret.Length == 0)
-        {
-            var zeros = new byte[nh];
-            effectivePskSecret = cs.Extract(zeros, zeros);
-        }
-
-        // Step 4: epoch_secret = Extract(member, psk_secret)
-        var epochSecret = cs.Extract(member, effectivePskSecret);
+        // Step 3: epoch_secret = ExpandWithLabel(intermediate_secret, "epoch", GroupContext, Nh)
+        var epochSecret = cs.ExpandWithLabel(intermediateSecret, "epoch", groupContext, nh);
 
         // Step 5: Derive all per-epoch secrets from epoch_secret
         var senderDataSecret = cs.DeriveSecret(epochSecret, "sender data");
