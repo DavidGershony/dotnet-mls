@@ -42,8 +42,8 @@ public sealed class SecretTree
     private readonly RatchetState?[] _handshakeRatchets;
     private readonly RatchetState?[] _applicationRatchets;
 
-    private static readonly byte[] LeftContext = [0x00];
-    private static readonly byte[] RightContext = [0x01];
+    private static readonly byte[] LeftContext = "left"u8.ToArray();
+    private static readonly byte[] RightContext = "right"u8.ToArray();
 
     /// <summary>The number of leaves in the tree.</summary>
     internal uint LeafCount => _leafCount;
@@ -165,7 +165,8 @@ public sealed class SecretTree
     /// </exception>
     public (byte[] key, byte[] nonce) GetHandshakeKeyAndNonceForGeneration(uint leafIndex, uint generation)
     {
-        EnsureLeafDerived(leafIndex);
+        if (_handshakeRatchets[leafIndex] == null)
+            EnsureLeafDerived(leafIndex);
         var ratchet = GetOrInitHandshakeRatchet(leafIndex);
         return GetKeyAndNonceForGeneration(ratchet, generation);
     }
@@ -184,7 +185,8 @@ public sealed class SecretTree
     /// </exception>
     public (byte[] key, byte[] nonce) GetApplicationKeyAndNonceForGeneration(uint leafIndex, uint generation)
     {
-        EnsureLeafDerived(leafIndex);
+        if (_applicationRatchets[leafIndex] == null)
+            EnsureLeafDerived(leafIndex);
         var ratchet = GetOrInitApplicationRatchet(leafIndex);
         return GetKeyAndNonceForGeneration(ratchet, generation);
     }
@@ -512,12 +514,14 @@ public sealed class SecretTree
     /// </summary>
     private (byte[] key, byte[] nonce, uint generation) ConsumeRatchet(RatchetState ratchet)
     {
-        var key = _cs.ExpandWithLabel(ratchet.Secret, "key", Array.Empty<byte>(), _cs.AeadKeySize);
-        var nonce = _cs.ExpandWithLabel(ratchet.Secret, "nonce", Array.Empty<byte>(), _cs.AeadNonceSize);
         var gen = ratchet.Generation;
+        var genContext = GenerationContext(gen);
 
-        // Advance: secret[n+1] = ExpandWithLabel(secret[n], "secret", "", SecretSize)
-        var nextSecret = _cs.ExpandWithLabel(ratchet.Secret, "secret", Array.Empty<byte>(), _cs.SecretSize);
+        var key = _cs.ExpandWithLabel(ratchet.Secret, "key", genContext, _cs.AeadKeySize);
+        var nonce = _cs.ExpandWithLabel(ratchet.Secret, "nonce", genContext, _cs.AeadNonceSize);
+
+        // Advance: secret[n+1] = DeriveTreeSecret(secret[n], "secret", n, SecretSize)
+        var nextSecret = _cs.ExpandWithLabel(ratchet.Secret, "secret", genContext, _cs.SecretSize);
 
         // Erase old secret
         Array.Clear(ratchet.Secret, 0, ratchet.Secret.Length);
@@ -540,24 +544,40 @@ public sealed class SecretTree
         // Fast-forward the ratchet to the target generation
         while (ratchet.Generation < generation)
         {
+            var genCtx = GenerationContext(ratchet.Generation);
             var nextSecret = _cs.ExpandWithLabel(
-                ratchet.Secret, "secret", Array.Empty<byte>(), _cs.SecretSize);
+                ratchet.Secret, "secret", genCtx, _cs.SecretSize);
             Array.Clear(ratchet.Secret, 0, ratchet.Secret.Length);
             ratchet.Secret = nextSecret;
             ratchet.Generation++;
         }
 
         // Now ratchet.Generation == generation; derive key and nonce, then advance
-        var key = _cs.ExpandWithLabel(ratchet.Secret, "key", Array.Empty<byte>(), _cs.AeadKeySize);
-        var nonce = _cs.ExpandWithLabel(ratchet.Secret, "nonce", Array.Empty<byte>(), _cs.AeadNonceSize);
+        var targetCtx = GenerationContext(generation);
+        var key = _cs.ExpandWithLabel(ratchet.Secret, "key", targetCtx, _cs.AeadKeySize);
+        var nonce = _cs.ExpandWithLabel(ratchet.Secret, "nonce", targetCtx, _cs.AeadNonceSize);
 
         // Advance past the consumed generation
-        var next = _cs.ExpandWithLabel(ratchet.Secret, "secret", Array.Empty<byte>(), _cs.SecretSize);
+        var next = _cs.ExpandWithLabel(ratchet.Secret, "secret", targetCtx, _cs.SecretSize);
         Array.Clear(ratchet.Secret, 0, ratchet.Secret.Length);
         ratchet.Secret = next;
         ratchet.Generation++;
 
         return (key, nonce);
+    }
+
+    /// <summary>
+    /// Encodes a generation number as a big-endian uint32 for DeriveTreeSecret context per RFC 9420 §9.
+    /// </summary>
+    private static byte[] GenerationContext(uint generation)
+    {
+        return new byte[]
+        {
+            (byte)(generation >> 24),
+            (byte)(generation >> 16),
+            (byte)(generation >> 8),
+            (byte)(generation & 0xFF)
+        };
     }
 
     /// <summary>

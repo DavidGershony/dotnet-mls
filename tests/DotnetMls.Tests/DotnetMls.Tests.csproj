@@ -13,5 +13,14 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\DotnetMls\DotnetMls.csproj" />
+    <ProjectReference Include="..\..\src\DotnetMls.Crypto\DotnetMls.Crypto.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Update="TestVectors\*.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="System.Text.Json" Version="9.0.0" />
   </ItemGroup>
 </Project>

@@ -121,8 +121,8 @@ public sealed class KeyScheduleEpoch
     /// <para>
     /// Per RFC 9420 Section 8, the derivation is:
     /// <code>
-    ///   pre_joiner         = ExpandWithLabel(init_secret, "joiner", GroupContext, Nh)
-    ///   joiner_secret      = Extract(pre_joiner, commit_secret)
+    ///   extracted           = Extract(init_secret, commit_secret)
+    ///   joiner_secret       = ExpandWithLabel(extracted, "joiner", GroupContext, Nh)
     ///   intermediate_secret = Extract(joiner_secret, psk_secret)
     ///   welcome_secret     = DeriveSecret(intermediate_secret, "welcome")
     ///   epoch_secret       = ExpandWithLabel(intermediate_secret, "epoch", GroupContext, Nh)
@@ -156,12 +156,14 @@ public sealed class KeyScheduleEpoch
     {
         var nh = cs.SecretSize;
 
-        // Step 1: Derive the joiner secret
-        // pre_joiner = ExpandWithLabel(init_secret, "joiner", GroupContext, Nh)
-        var preJoiner = cs.ExpandWithLabel(initSecret, "joiner", groupContext, nh);
-
-        // joiner_secret = Extract(pre_joiner, commit_secret)
-        var joinerSecret = cs.Extract(preJoiner, commitSecret);
+        // Step 1: Derive the joiner secret per RFC 9420 §8:
+        //   init_secret --> KDF.Extract <-- commit_secret
+        //                      |
+        //   ExpandWithLabel(., "joiner", GroupContext, Nh)
+        //                      |
+        //                joiner_secret
+        var extracted = cs.Extract(initSecret, commitSecret);
+        var joinerSecret = cs.ExpandWithLabel(extracted, "joiner", groupContext, nh);
 
         // Step 2: intermediate_secret = KDF.Extract(salt=joiner_secret, ikm=psk_secret)
         // psk_secret defaults to zeros(KDF.Nh) when no PSKs

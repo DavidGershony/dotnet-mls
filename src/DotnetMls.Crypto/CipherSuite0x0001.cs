@@ -88,19 +88,14 @@ public sealed class CipherSuite0x0001 : ICipherSuite
     ///   ExpandWithLabel(Secret, Label, Context, Length) =
     ///     KDF.Expand(Secret, KDFLabel, Length)
     ///   where KDFLabel is:
+    ///   struct {
     ///     uint16 length = Length;
     ///     opaque label&lt;V&gt; = "MLS 1.0 " + Label;
     ///     opaque context&lt;V&gt; = Context;
-    ///   Encoded as: uint16(Length) || uint8(label_len) || label || uint8(context_len) || context
-    ///
-    ///   Actually per the TLS-style encoding used in RFC 9420:
-    ///   struct {
-    ///     uint16 length = Length;
-    ///     opaque label&lt;7..255&gt; = "MLS 1.0 " + Label;
-    ///     opaque context&lt;0..255&gt; = Context;
     ///   } KDFLabel;
     ///
-    ///   This encodes as: uint16(Length) || uint8(len("MLS 1.0 " + Label)) || "MLS 1.0 " || Label || uint8(len(Context)) || Context
+    ///   &lt;V&gt; means QUIC variable-length integer prefix (RFC 9000 §16).
+    ///   Encoded as: uint16(Length) || VarInt(label_len) || label || VarInt(context_len) || context
     /// </remarks>
     public byte[] ExpandWithLabel(byte[] secret, string label, byte[] context, int length)
     {
@@ -109,21 +104,26 @@ public sealed class CipherSuite0x0001 : ICipherSuite
         Buffer.BlockCopy(MlsLabelPrefix, 0, fullLabel, 0, MlsLabelPrefix.Length);
         Buffer.BlockCopy(labelBytes, 0, fullLabel, MlsLabelPrefix.Length, labelBytes.Length);
 
-        // KDFLabel = uint16(length) || uint8(fullLabel.Length) || fullLabel || uint8(context.Length) || context
-        var kdfLabel = new byte[2 + 1 + fullLabel.Length + 1 + context.Length];
+        var labelLenBytes = EncodeVarInt(fullLabel.Length);
+        var contextLenBytes = EncodeVarInt(context.Length);
+
+        // KDFLabel = uint16(length) || VarInt(fullLabel.Length) || fullLabel || VarInt(context.Length) || context
+        var kdfLabel = new byte[2 + labelLenBytes.Length + fullLabel.Length + contextLenBytes.Length + context.Length];
         var offset = 0;
 
         // uint16 length (big-endian)
         kdfLabel[offset++] = (byte)(length >> 8);
         kdfLabel[offset++] = (byte)(length & 0xFF);
 
-        // uint8 label length + label
-        kdfLabel[offset++] = (byte)fullLabel.Length;
+        // VarInt label length + label
+        Buffer.BlockCopy(labelLenBytes, 0, kdfLabel, offset, labelLenBytes.Length);
+        offset += labelLenBytes.Length;
         Buffer.BlockCopy(fullLabel, 0, kdfLabel, offset, fullLabel.Length);
         offset += fullLabel.Length;
 
-        // uint8 context length + context
-        kdfLabel[offset++] = (byte)context.Length;
+        // VarInt context length + context
+        Buffer.BlockCopy(contextLenBytes, 0, kdfLabel, offset, contextLenBytes.Length);
+        offset += contextLenBytes.Length;
         Buffer.BlockCopy(context, 0, kdfLabel, offset, context.Length);
 
         return _hkdf.Expand(secret, kdfLabel, length);
