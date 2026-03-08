@@ -4,6 +4,7 @@ using DotnetMls.Codec;
 using DotnetMls.Crypto;
 using DotnetMls.KeySchedule;
 using DotnetMls.Tree;
+using DotnetMls.Types;
 using Xunit;
 
 namespace DotnetMls.Tests;
@@ -719,5 +720,74 @@ public class Rfc9420TestVectorTests
 
         Assert.Equal(Hex(v.SenderData.Key), key);
         Assert.Equal(Hex(v.SenderData.Nonce), nonce);
+    }
+
+    // ================================================================
+    // PSK Secret Test Vectors (RFC 9420 Section 8.4)
+    // ================================================================
+
+    public class PskSecretVector
+    {
+        [JsonPropertyName("cipher_suite")]
+        public int CipherSuite { get; set; }
+
+        [JsonPropertyName("psks")]
+        public PskEntry[] Psks { get; set; } = Array.Empty<PskEntry>();
+
+        [JsonPropertyName("psk_secret")]
+        public string PskSecret { get; set; } = "";
+    }
+
+    public class PskEntry
+    {
+        [JsonPropertyName("psk_id")]
+        public string PskId { get; set; } = "";
+
+        [JsonPropertyName("psk")]
+        public string Psk { get; set; } = "";
+
+        [JsonPropertyName("psk_nonce")]
+        public string PskNonce { get; set; } = "";
+    }
+
+    [Fact]
+    public void PskSecret_ZeroPsks_ReturnsAllZeros()
+    {
+        // RFC 9420 §8.4: When there are no PSKs, psk_secret is zeros(KDF.Nh)
+        var cs = new CipherSuite0x0001();
+        var result = PskSecretDerivation.ComputePskSecret(cs, Array.Empty<PskSecretDerivation.PskInput>());
+        Assert.Equal(new byte[cs.SecretSize], result);
+    }
+
+    [Fact]
+    public void PskSecret_MatchesOfficialVectors()
+    {
+        // Validates against the official RFC 9420 psk_secret test vectors for
+        // cipher suite 1 (MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519),
+        // covering 0 to 10 PSKs per case.
+        var vectors = JsonSerializer.Deserialize<PskSecretVector[]>(
+            File.ReadAllText(VectorPath("psk_secret.json")), JsonOpts)!;
+
+        var cs = new CipherSuite0x0001();
+
+        foreach (var v in vectors.Where(x => x.CipherSuite == 1))
+        {
+            // Build PSK inputs from the test vector
+            var pskInputs = v.Psks.Select(p => new PskSecretDerivation.PskInput
+            {
+                Id = new PreSharedKeyId
+                {
+                    PskType = PskType.External,
+                    PskId = Hex(p.PskId),
+                    PskNonce = Hex(p.PskNonce),
+                },
+                PskValue = Hex(p.Psk),
+            }).ToArray();
+
+            var expected = Hex(v.PskSecret);
+            var actual = PskSecretDerivation.ComputePskSecret(cs, pskInputs);
+
+            Assert.Equal(expected, actual);
+        }
     }
 }
