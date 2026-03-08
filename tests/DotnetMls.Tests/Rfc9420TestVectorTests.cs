@@ -55,66 +55,71 @@ public class Rfc9420TestVectorTests
 
         [JsonPropertyName("sibling")]
         public uint?[] Sibling { get; set; } = Array.Empty<uint?>();
+
+        public override string ToString() => $"n_leaves={NLeaves}";
     }
 
-    [Fact]
-    public void TreeMath_MatchesOfficialVectors()
+    public static IEnumerable<object[]> TreeMathVectors()
     {
         var vectors = JsonSerializer.Deserialize<TreeMathVector[]>(
             File.ReadAllText(VectorPath("tree-math.json")), JsonOpts)!;
-
         foreach (var v in vectors)
+            yield return new object[] { v };
+    }
+
+    [Theory]
+    [MemberData(nameof(TreeMathVectors))]
+    public void TreeMath_MatchesOfficialVectors(TreeMathVector v)
+    {
+        // n_nodes
+        Assert.Equal(v.NNodes, TreeMath.NodeCount(v.NLeaves));
+
+        // root
+        if (v.NLeaves > 0)
+            Assert.Equal(v.Root, TreeMath.Root(v.NLeaves));
+
+        uint nodeCount = v.NNodes;
+
+        for (uint i = 0; i < v.NNodes; i++)
         {
-            // n_nodes
-            Assert.Equal(v.NNodes, TreeMath.NodeCount(v.NLeaves));
-
-            // root
-            if (v.NLeaves > 0)
-                Assert.Equal(v.Root, TreeMath.Root(v.NLeaves));
-
-            uint nodeCount = v.NNodes;
-
-            for (uint i = 0; i < v.NNodes; i++)
+            // left
+            if (i < (uint)v.Left.Length)
             {
-                // left
-                if (i < (uint)v.Left.Length)
+                if (v.Left[i].HasValue)
                 {
-                    if (v.Left[i].HasValue)
-                    {
-                        Assert.False(TreeMath.IsLeaf(i),
-                            $"n_leaves={v.NLeaves}: node {i} has left child but IsLeaf=true");
-                        Assert.Equal(v.Left[i].Value, TreeMath.Left(i));
-                    }
+                    Assert.False(TreeMath.IsLeaf(i),
+                        $"n_leaves={v.NLeaves}: node {i} has left child but IsLeaf=true");
+                    Assert.Equal(v.Left[i].Value, TreeMath.Left(i));
                 }
+            }
 
-                // right
-                if (i < (uint)v.Right.Length)
+            // right
+            if (i < (uint)v.Right.Length)
+            {
+                if (v.Right[i].HasValue)
                 {
-                    if (v.Right[i].HasValue)
-                    {
-                        Assert.False(TreeMath.IsLeaf(i),
-                            $"n_leaves={v.NLeaves}: node {i} has right child but IsLeaf=true");
-                        Assert.Equal(v.Right[i].Value, TreeMath.Right(i));
-                    }
+                    Assert.False(TreeMath.IsLeaf(i),
+                        $"n_leaves={v.NLeaves}: node {i} has right child but IsLeaf=true");
+                    Assert.Equal(v.Right[i].Value, TreeMath.Right(i));
                 }
+            }
 
-                // parent
-                if (i < (uint)v.Parent.Length)
+            // parent
+            if (i < (uint)v.Parent.Length)
+            {
+                if (v.Parent[i].HasValue)
                 {
-                    if (v.Parent[i].HasValue)
-                    {
-                        Assert.Equal(v.Parent[i].Value, TreeMath.Parent(i, nodeCount));
-                    }
-                    // null parent means root node — calling Parent would throw
+                    Assert.Equal(v.Parent[i].Value, TreeMath.Parent(i, nodeCount));
                 }
+                // null parent means root node — calling Parent would throw
+            }
 
-                // sibling
-                if (i < (uint)v.Sibling.Length)
+            // sibling
+            if (i < (uint)v.Sibling.Length)
+            {
+                if (v.Sibling[i].HasValue)
                 {
-                    if (v.Sibling[i].HasValue)
-                    {
-                        Assert.Equal(v.Sibling[i].Value, TreeMath.Sibling(i, nodeCount));
-                    }
+                    Assert.Equal(v.Sibling[i].Value, TreeMath.Sibling(i, nodeCount));
                 }
             }
         }
@@ -477,6 +482,8 @@ public class Rfc9420TestVectorTests
     [Fact]
     public void KeySchedule_MatchesOfficialVectors()
     {
+        // Epochs are sequential (each uses previous epoch's init_secret),
+        // so this test must remain a single [Fact] with a loop.
         var vectors = JsonSerializer.Deserialize<KeyScheduleVector[]>(
             File.ReadAllText(VectorPath("key-schedule.json")), JsonOpts)!;
 
@@ -528,27 +535,32 @@ public class Rfc9420TestVectorTests
 
         [JsonPropertyName("length")]
         public ulong Length { get; set; }
+
+        public override string ToString() => $"length={Length}";
     }
 
-    [Fact]
-    public void Deserialization_VarInt_MatchesOfficialVectors()
+    public static IEnumerable<object[]> DeserializationVectors()
     {
         var vectors = JsonSerializer.Deserialize<DeserializationVector[]>(
             File.ReadAllText(VectorPath("deserialization.json")), JsonOpts)!;
-
         foreach (var v in vectors)
-        {
-            byte[] header = Hex(v.VlbytesHeader);
+            yield return new object[] { v };
+    }
 
-            // Decode
-            var reader = new TlsReader(header);
-            ulong decoded = QuicVarint.Read(reader);
-            Assert.Equal(v.Length, decoded);
+    [Theory]
+    [MemberData(nameof(DeserializationVectors))]
+    public void Deserialization_VarInt_MatchesOfficialVectors(DeserializationVector v)
+    {
+        byte[] header = Hex(v.VlbytesHeader);
 
-            // Encode
-            byte[] encoded = TlsCodec.Serialize(w => QuicVarint.Write(w, v.Length));
-            Assert.Equal(header, encoded);
-        }
+        // Decode
+        var reader = new TlsReader(header);
+        ulong decoded = QuicVarint.Read(reader);
+        Assert.Equal(v.Length, decoded);
+
+        // Encode
+        byte[] encoded = TlsCodec.Serialize(w => QuicVarint.Write(w, v.Length));
+        Assert.Equal(header, encoded);
     }
 
     // ================================================================
@@ -640,6 +652,8 @@ public class Rfc9420TestVectorTests
 
         [JsonPropertyName("leaves")]
         public LeafGeneration[][] Leaves { get; set; } = Array.Empty<LeafGeneration[]>();
+
+        public override string ToString() => $"cs={CipherSuite},leaves={Leaves.Length}";
     }
 
     public class SenderDataCase
@@ -668,32 +682,34 @@ public class Rfc9420TestVectorTests
         public string HandshakeNonce { get; set; } = "";
     }
 
-    [Fact]
-    public void SecretTree_MatchesOfficialVectors()
+    public static IEnumerable<object[]> SecretTreeVectors()
     {
         var vectors = JsonSerializer.Deserialize<SecretTreeVector[]>(
             File.ReadAllText(VectorPath("secret-tree.json")), JsonOpts)!;
-
-        var cs = new CipherSuite0x0001();
-
         foreach (var v in vectors.Where(x => x.CipherSuite == 1))
+            yield return new object[] { v };
+    }
+
+    [Theory]
+    [MemberData(nameof(SecretTreeVectors))]
+    public void SecretTree_MatchesOfficialVectors(SecretTreeVector v)
+    {
+        var cs = new CipherSuite0x0001();
+        uint leafCount = (uint)v.Leaves.Length;
+        var tree = new SecretTree(cs, Hex(v.EncryptionSecret), leafCount);
+
+        for (uint leafIdx = 0; leafIdx < leafCount; leafIdx++)
         {
-            uint leafCount = (uint)v.Leaves.Length;
-            var tree = new SecretTree(cs, Hex(v.EncryptionSecret), leafCount);
-
-            for (uint leafIdx = 0; leafIdx < leafCount; leafIdx++)
+            foreach (var gen in v.Leaves[leafIdx])
             {
-                foreach (var gen in v.Leaves[leafIdx])
-                {
-                    // Use generation-specific lookup to handle non-consecutive generations
-                    var (hKey, hNonce) = tree.GetHandshakeKeyAndNonceForGeneration(leafIdx, gen.Generation);
-                    Assert.Equal(Hex(gen.HandshakeKey), hKey);
-                    Assert.Equal(Hex(gen.HandshakeNonce), hNonce);
+                // Use generation-specific lookup to handle non-consecutive generations
+                var (hKey, hNonce) = tree.GetHandshakeKeyAndNonceForGeneration(leafIdx, gen.Generation);
+                Assert.Equal(Hex(gen.HandshakeKey), hKey);
+                Assert.Equal(Hex(gen.HandshakeNonce), hNonce);
 
-                    var (aKey, aNonce) = tree.GetApplicationKeyAndNonceForGeneration(leafIdx, gen.Generation);
-                    Assert.Equal(Hex(gen.ApplicationKey), aKey);
-                    Assert.Equal(Hex(gen.ApplicationNonce), aNonce);
-                }
+                var (aKey, aNonce) = tree.GetApplicationKeyAndNonceForGeneration(leafIdx, gen.Generation);
+                Assert.Equal(Hex(gen.ApplicationKey), aKey);
+                Assert.Equal(Hex(gen.ApplicationNonce), aNonce);
             }
         }
     }
@@ -736,6 +752,8 @@ public class Rfc9420TestVectorTests
 
         [JsonPropertyName("psk_secret")]
         public string PskSecret { get; set; } = "";
+
+        public override string ToString() => $"cs={CipherSuite},psk_count={Psks.Length}";
     }
 
     public class PskEntry
@@ -759,35 +777,35 @@ public class Rfc9420TestVectorTests
         Assert.Equal(new byte[cs.SecretSize], result);
     }
 
-    [Fact]
-    public void PskSecret_MatchesOfficialVectors()
+    public static IEnumerable<object[]> PskSecretVectors()
     {
-        // Validates against the official RFC 9420 psk_secret test vectors for
-        // cipher suite 1 (MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519),
-        // covering 0 to 10 PSKs per case.
         var vectors = JsonSerializer.Deserialize<PskSecretVector[]>(
             File.ReadAllText(VectorPath("psk_secret.json")), JsonOpts)!;
+        foreach (var v in vectors.Where(x => x.CipherSuite == 1))
+            yield return new object[] { v };
+    }
 
+    [Theory]
+    [MemberData(nameof(PskSecretVectors))]
+    public void PskSecret_MatchesOfficialVectors(PskSecretVector v)
+    {
         var cs = new CipherSuite0x0001();
 
-        foreach (var v in vectors.Where(x => x.CipherSuite == 1))
+        // Build PSK inputs from the test vector
+        var pskInputs = v.Psks.Select(p => new PskSecretDerivation.PskInput
         {
-            // Build PSK inputs from the test vector
-            var pskInputs = v.Psks.Select(p => new PskSecretDerivation.PskInput
+            Id = new PreSharedKeyId
             {
-                Id = new PreSharedKeyId
-                {
-                    PskType = PskType.External,
-                    PskId = Hex(p.PskId),
-                    PskNonce = Hex(p.PskNonce),
-                },
-                PskValue = Hex(p.Psk),
-            }).ToArray();
+                PskType = PskType.External,
+                PskId = Hex(p.PskId),
+                PskNonce = Hex(p.PskNonce),
+            },
+            PskValue = Hex(p.Psk),
+        }).ToArray();
 
-            var expected = Hex(v.PskSecret);
-            var actual = PskSecretDerivation.ComputePskSecret(cs, pskInputs);
+        var expected = Hex(v.PskSecret);
+        var actual = PskSecretDerivation.ComputePskSecret(cs, pskInputs);
 
-            Assert.Equal(expected, actual);
-        }
+        Assert.Equal(expected, actual);
     }
 }
