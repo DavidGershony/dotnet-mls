@@ -7,6 +7,8 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write # Required for NuGet trusted publishing OIDC
 
     steps:
       - uses: actions/checkout@v4
@@ -35,5 +37,11 @@ jobs:
       - name: Pack DotnetMls
         run: dotnet pack src/DotnetMls/DotnetMls.csproj --no-build --configuration Release /p:Version=${{ steps.version.outputs.VERSION }} --output ./nupkgs
 
+      - name: NuGet login (OIDC trusted publishing)
+        uses: NuGet/login@v1
+        id: login
+        with:
+          user: MadMarmot
+
       - name: Push to NuGet.org
-        run: dotnet nuget push ./nupkgs/*.nupkg --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
+        run: dotnet nuget push ./nupkgs/*.nupkg --api-key ${{ steps.login.outputs.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
