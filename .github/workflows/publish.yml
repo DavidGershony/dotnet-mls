@@ -7,6 +7,7 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       id-token: write # Required for NuGet trusted publishing OIDC
 
@@ -41,7 +42,7 @@ jobs:
         uses: NuGet/login@v1
         id: login
         with:
-          user: TheZombieDude
+          user: MadMarmot
 
       - name: Push to NuGet.org
         run: dotnet nuget push ./nupkgs/*.nupkg --api-key ${{ steps.login.outputs.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
