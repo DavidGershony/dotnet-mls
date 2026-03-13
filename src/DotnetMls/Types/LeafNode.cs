@@ -39,6 +39,12 @@ public sealed class LeafNode
     public Lifetime? Lifetime { get; set; }
 
     /// <summary>
+    /// The parent hash for commit-sourced leaf nodes (RFC 9420 §7.9.2).
+    /// Present when <see cref="Source"/> is <see cref="LeafNodeSource.Commit"/>.
+    /// </summary>
+    public byte[] ParentHash { get; set; } = Array.Empty<byte>();
+
+    /// <summary>
     /// Extensions associated with this leaf node.
     /// </summary>
     public Extension[] Extensions { get; set; } = Array.Empty<Extension>();
@@ -64,6 +70,10 @@ public sealed class LeafNode
         {
             Lifetime!.WriteTo(writer);
         }
+        else if (Source == LeafNodeSource.Commit)
+        {
+            writer.WriteOpaqueV(ParentHash);
+        }
 
         writer.WriteVectorV(inner =>
         {
@@ -88,6 +98,10 @@ public sealed class LeafNode
         if (node.Source == LeafNodeSource.KeyPackage)
         {
             node.Lifetime = Types.Lifetime.ReadFrom(reader);
+        }
+        else if (node.Source == LeafNodeSource.Commit)
+        {
+            node.ParentHash = reader.ReadOpaqueV();
         }
 
         byte[] extData = reader.ReadOpaqueV();

@@ -418,10 +418,9 @@ public sealed class RatchetTree
     /// <summary>
     /// Serializes the entire ratchet tree for inclusion in Welcome messages.
     ///
-    /// TLS encoding per RFC 9420 §12.4.3.3: vector of optional&lt;Node&gt;.
-    /// Node type (leaf vs parent) is determined by position (even=leaf, odd=parent),
-    /// with NO explicit nodeType discriminator byte.
-    /// Each entry: uint8(present=1/0), if present: serialized LeafNode or ParentNode.
+    /// TLS encoding per RFC 9420 §7.5 and §12.4.3.3: vector of optional&lt;Node&gt;.
+    /// Each entry: uint8(present), if present: uint8(nodeType) + LeafNode/ParentNode.
+    /// NodeType: 1 = leaf, 2 = parent.
     /// </summary>
     public void WriteTo(TlsWriter writer)
     {
@@ -442,6 +441,7 @@ public sealed class RatchetTree
                     else
                     {
                         inner.WriteUint8(1); // present
+                        inner.WriteUint8(1); // nodeType = leaf
                         leaf.Value.WriteTo(inner);
                     }
                 }
@@ -454,6 +454,7 @@ public sealed class RatchetTree
                     else
                     {
                         inner.WriteUint8(1); // present
+                        inner.WriteUint8(2); // nodeType = parent
                         parent.Value.WriteTo(inner);
                     }
                 }
@@ -480,7 +481,7 @@ public sealed class RatchetTree
             byte present = sub.ReadUint8();
             if (present == 0)
             {
-                // Blank node
+                // Blank node - type inferred from position
                 if (TreeMath.IsLeaf(nodeIndex))
                     tree._nodes.Add(new TreeNode.Leaf(null));
                 else
@@ -488,17 +489,23 @@ public sealed class RatchetTree
             }
             else
             {
-                // Present node - type determined by position, NOT by a discriminator byte
-                // Per RFC 9420 §12.4.3.3: even positions are leaves, odd are parents
-                if (TreeMath.IsLeaf(nodeIndex))
+                // Present node — RFC 9420 §7.5: Node has a NodeType discriminator byte
+                // NodeType: 1 = leaf, 2 = parent
+                byte nodeType = sub.ReadUint8();
+                if (nodeType == 1)
                 {
                     var leafNode = LeafNode.ReadFrom(sub);
                     tree._nodes.Add(new TreeNode.Leaf(leafNode));
                 }
-                else
+                else if (nodeType == 2)
                 {
                     var parentNode = ParentNode.ReadFrom(sub);
                     tree._nodes.Add(new TreeNode.Parent(parentNode));
+                }
+                else
+                {
+                    throw new Codec.TlsDecodingException(
+                        $"Invalid NodeType {nodeType} at node index {nodeIndex}.");
                 }
             }
 

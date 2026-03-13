@@ -707,13 +707,12 @@ public class RatchetTreeTests
     }
 
     /// <summary>
-    /// RFC 9420 §12.4.3.3: ratchet_tree serialization uses position-based node type
-    /// (even index = leaf, odd index = parent), with NO explicit nodeType discriminator byte.
-    /// The wire format for each node should be: uint8(present), then if present, directly
-    /// the LeafNode or ParentNode TLS encoding (determined by position).
+    /// RFC 9420 §7.5 and §12.4.3.3: ratchet_tree serialization uses optional&lt;Node&gt;.
+    /// Node includes a NodeType discriminator byte (1=leaf, 2=parent).
+    /// Wire format: uint8(present), if present: uint8(nodeType) + LeafNode/ParentNode.
     /// </summary>
     [Fact]
-    public void RatchetTree_Serialization_NoNodeTypeDiscriminator()
+    public void RatchetTree_Serialization_IncludesNodeTypeDiscriminator()
     {
         var tree = new RatchetTree();
         tree.AddLeaf(MakeLeaf(1));
@@ -726,24 +725,21 @@ public class RatchetTreeTests
         var treeBytes = outerReader.ReadOpaqueV();
         var sub = new TlsReader(treeBytes);
 
-        // Build the expected format manually (position-based, no nodeType byte):
-        // Node 0 (leaf, present): [1][LeafNode bytes]
-        // Node 1 (parent, blank): [0]
-        // Node 2 (leaf, present): [1][LeafNode bytes]
-
         byte[] expectedLeaf0Bytes = TlsCodec.Serialize(w => MakeLeaf(1).WriteTo(w));
         byte[] expectedLeaf2Bytes = TlsCodec.Serialize(w => MakeLeaf(2).WriteTo(w));
 
-        // Node 0: present leaf
+        // Node 0: present leaf with nodeType=1
         Assert.Equal(1, sub.ReadUint8()); // present
+        Assert.Equal(1, sub.ReadUint8()); // nodeType = leaf
         byte[] actualLeaf0 = sub.ReadBytes(expectedLeaf0Bytes.Length);
         Assert.Equal(expectedLeaf0Bytes, actualLeaf0);
 
         // Node 1: blank parent
         Assert.Equal(0, sub.ReadUint8()); // absent
 
-        // Node 2: present leaf
+        // Node 2: present leaf with nodeType=1
         Assert.Equal(1, sub.ReadUint8()); // present
+        Assert.Equal(1, sub.ReadUint8()); // nodeType = leaf
         byte[] actualLeaf2 = sub.ReadBytes(expectedLeaf2Bytes.Length);
         Assert.Equal(expectedLeaf2Bytes, actualLeaf2);
 
@@ -751,29 +747,31 @@ public class RatchetTreeTests
     }
 
     /// <summary>
-    /// Verifies that a ratchet tree encoded in RFC-compliant format (no nodeType byte)
-    /// can be correctly deserialized by ReadFrom.
+    /// Verifies that a ratchet tree with NodeType discriminator bytes round-trips
+    /// through WriteTo/ReadFrom correctly.
     /// </summary>
     [Fact]
-    public void RatchetTree_ReadFrom_RfcCompliantFormat_RoundTrips()
+    public void RatchetTree_ReadFrom_WithNodeType_RoundTrips()
     {
-        // Build the RFC-compliant wire format manually (no nodeType discriminator)
         var leaf1 = MakeLeaf(1);
         var leaf2 = MakeLeaf(2);
 
+        // Build wire format with NodeType discriminator (RFC 9420 §7.5)
         byte[] rfcTreeBytes = TlsCodec.Serialize(outerWriter =>
         {
             outerWriter.WriteVectorV(inner =>
             {
-                // Node 0 (even = leaf): present + LeafNode
+                // Node 0 (leaf): present + nodeType=1 + LeafNode
                 inner.WriteUint8(1);
+                inner.WriteUint8(1); // nodeType = leaf
                 leaf1.WriteTo(inner);
 
-                // Node 1 (odd = parent): blank
+                // Node 1 (parent): blank
                 inner.WriteUint8(0);
 
-                // Node 2 (even = leaf): present + LeafNode
+                // Node 2 (leaf): present + nodeType=1 + LeafNode
                 inner.WriteUint8(1);
+                inner.WriteUint8(1); // nodeType = leaf
                 leaf2.WriteTo(inner);
             });
         });
