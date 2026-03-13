@@ -1327,4 +1327,148 @@ public class Rfc9420TestVectorTests
             $"expected {Convert.ToHexString(withTag)}, got {Convert.ToHexString(reserialized)}");
     }
 
+    // ================================================================
+    // Tree Validation Test Vectors (RFC 9420 Section 13.6)
+    // ================================================================
+
+    public class TreeValidationVector
+    {
+        [JsonPropertyName("cipher_suite")]
+        public int CipherSuite { get; set; }
+
+        [JsonPropertyName("tree")]
+        public string TreeData { get; set; } = "";
+
+        [JsonPropertyName("group_id")]
+        public string GroupId { get; set; } = "";
+
+        [JsonPropertyName("tree_hashes")]
+        public string[] TreeHashes { get; set; } = Array.Empty<string>();
+
+        [JsonPropertyName("resolutions")]
+        public uint[][] Resolutions { get; set; } = Array.Empty<uint[]>();
+    }
+
+    [Fact]
+    public void TreeValidation_TreeHash_MatchesOfficialVectors()
+    {
+        var vectors = JsonSerializer.Deserialize<TreeValidationVector[]>(
+            File.ReadAllText(VectorPath("tree-validation.json")), JsonOpts)!;
+
+        var v = vectors.First(x => x.CipherSuite == 1);
+        var cs = new CipherSuite0x0001();
+
+        var tree = Tree.RatchetTree.ReadFrom(new TlsReader(Hex(v.TreeData)));
+
+        // Verify tree round-trip
+        byte[] reserialized = TlsCodec.Serialize(w => tree.WriteTo(w));
+        Assert.Equal(Hex(v.TreeData), reserialized);
+
+        // Verify tree hash for each node
+        for (int i = 0; i < v.TreeHashes.Length; i++)
+        {
+            byte[] expected = Hex(v.TreeHashes[i]);
+            byte[] actual = tree.ComputeTreeHash(cs, (uint)i);
+            Assert.True(expected.SequenceEqual(actual),
+                $"Tree hash mismatch at node {i}: " +
+                $"expected {v.TreeHashes[i][..16]}..., got {Convert.ToHexString(actual)[..16]}...");
+        }
+
+        // Verify resolutions for each node
+        for (int i = 0; i < v.Resolutions.Length; i++)
+        {
+            var expected = v.Resolutions[i];
+            var actual = tree.Resolution((uint)i);
+            Assert.Equal(expected, actual.ToArray());
+        }
+    }
+
+    // ================================================================
+    // Tree Operations Test Vectors (RFC 9420 Section 13.8)
+    // ================================================================
+
+    public class TreeOperationsVector
+    {
+        [JsonPropertyName("cipher_suite")]
+        public int CipherSuite { get; set; }
+
+        [JsonPropertyName("proposal")]
+        public string Proposal { get; set; } = "";
+
+        [JsonPropertyName("proposal_sender")]
+        public uint ProposalSender { get; set; }
+
+        [JsonPropertyName("tree_before")]
+        public string TreeBefore { get; set; } = "";
+
+        [JsonPropertyName("tree_after")]
+        public string TreeAfter { get; set; } = "";
+
+        [JsonPropertyName("tree_hash_before")]
+        public string TreeHashBefore { get; set; } = "";
+
+        [JsonPropertyName("tree_hash_after")]
+        public string TreeHashAfter { get; set; } = "";
+    }
+
+    public static IEnumerable<object[]> TreeOperationsVectors()
+    {
+        var vectors = JsonSerializer.Deserialize<TreeOperationsVector[]>(
+            File.ReadAllText(VectorPath("tree-operations.json")), JsonOpts)!;
+        foreach (var v in vectors.Where(x => x.CipherSuite == 1))
+            yield return new object[] { v };
+    }
+
+    /// <summary>
+    /// Validates tree operations: parse tree, verify tree hash, apply proposal,
+    /// verify resulting tree hash matches expected value.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(TreeOperationsVectors))]
+    public void TreeOperations_MatchesOfficialVectors(TreeOperationsVector v)
+    {
+        var cs = new CipherSuite0x0001();
+
+        // Parse and verify tree_before
+        var treeBefore = Tree.RatchetTree.ReadFrom(new TlsReader(Hex(v.TreeBefore)));
+        uint rootBefore = TreeMath.Root(treeBefore.LeafCount);
+        byte[] hashBefore = treeBefore.ComputeTreeHash(cs, rootBefore);
+        Assert.Equal(Hex(v.TreeHashBefore), hashBefore);
+
+        // Parse the proposal (includes type tag)
+        var proposal = Types.Proposal.ReadFrom(new TlsReader(Hex(v.Proposal)));
+
+        // Apply the proposal to the tree
+        switch (proposal)
+        {
+            case AddProposal addProposal:
+                treeBefore.AddLeaf(addProposal.KeyPackage.LeafNode);
+                break;
+            case UpdateProposal updateProposal:
+                treeBefore.SetLeaf(v.ProposalSender, updateProposal.LeafNode);
+                // RFC 9420 §12.4.2: blank the direct path after an Update
+                var directPath = TreeMath.DirectPath(v.ProposalSender, treeBefore.LeafCount);
+                foreach (uint dp in directPath)
+                    treeBefore.SetParent(dp, null);
+                break;
+            case RemoveProposal removeProposal:
+                treeBefore.BlankLeaf(removeProposal.LeafIndex);
+                break;
+            default:
+                Assert.Fail($"Unexpected proposal type: {proposal.ProposalType}");
+                break;
+        }
+
+        // Verify tree_after hash
+        uint rootAfter = TreeMath.Root(treeBefore.LeafCount);
+        byte[] hashAfter = treeBefore.ComputeTreeHash(cs, rootAfter);
+        Assert.Equal(Hex(v.TreeHashAfter), hashAfter);
+
+        // Also verify the expected tree_after deserializes to the same hash
+        var treeAfter = Tree.RatchetTree.ReadFrom(new TlsReader(Hex(v.TreeAfter)));
+        uint rootExpected = TreeMath.Root(treeAfter.LeafCount);
+        byte[] hashExpected = treeAfter.ComputeTreeHash(cs, rootExpected);
+        Assert.Equal(Hex(v.TreeHashAfter), hashExpected);
+    }
+
 }

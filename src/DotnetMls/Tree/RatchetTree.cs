@@ -277,12 +277,16 @@ public sealed class RatchetTree
 
     private byte[] ComputeLeafTreeHash(ICipherSuite cs, uint nodeIndex)
     {
-        // TreeHashInput for leaf:
+        // TreeHashInput for leaf (RFC 9420 §7.8):
         //   uint8 node_type = 1 (leaf)
-        //   optional<LeafNode> leaf_node
+        //   LeafNodeHashInput:
+        //     uint32 leaf_index
+        //     optional<LeafNode> leaf_node
+        uint leafIndex = nodeIndex / 2;
         var input = TlsCodec.Serialize(writer =>
         {
             writer.WriteUint8(1); // leaf node type
+            writer.WriteUint32(leafIndex);
 
             var node = GetNode(nodeIndex);
             if (node is TreeNode.Leaf leaf && leaf.Value != null)
@@ -301,29 +305,23 @@ public sealed class RatchetTree
 
     private byte[] ComputeParentTreeHash(ICipherSuite cs, uint nodeIndex)
     {
-        // Compute child hashes first
+        // Compute child hashes first — always recurse via ComputeTreeHash.
+        // In a left-balanced tree, Right(x) may exceed _nodes.Count, but
+        // descendants of that node can still be within the tree (e.g. for
+        // 9 leaves, Right(root=15)=23, but Left(Left(23))=16 is a real leaf).
+        // ComputeTreeHash handles out-of-bounds nodes via GetNode() returning null.
         uint left = TreeMath.Left(nodeIndex);
         uint right = TreeMath.Right(nodeIndex);
 
         byte[] leftHash = ComputeTreeHash(cs, left);
+        byte[] rightHash = ComputeTreeHash(cs, right);
 
-        // Right child might be beyond the tree in a truncated tree
-        byte[] rightHash;
-        if (right < (uint)_nodes.Count)
-        {
-            rightHash = ComputeTreeHash(cs, right);
-        }
-        else
-        {
-            // Hash of an empty/absent subtree: treat as blank leaf
-            rightHash = ComputeBlankSubtreeHash(cs, right);
-        }
-
-        // TreeHashInput for parent:
+        // TreeHashInput for parent (RFC 9420 §7.8):
         //   uint8 node_type = 2 (parent)
-        //   optional<ParentNode> parent_node
-        //   opaque left_hash<V>
-        //   opaque right_hash<V>
+        //   ParentNodeHashInput:
+        //     optional<ParentNode> parent_node
+        //     opaque left_hash<V>
+        //     opaque right_hash<V>
         var input = TlsCodec.Serialize(writer =>
         {
             writer.WriteUint8(2); // parent node type
@@ -344,40 +342,6 @@ public sealed class RatchetTree
         });
 
         return cs.Hash(input);
-    }
-
-    /// <summary>
-    /// Computes the hash for a subtree that is entirely outside the tree bounds.
-    /// This is treated as a tree of blank nodes.
-    /// </summary>
-    private byte[] ComputeBlankSubtreeHash(ICipherSuite cs, uint nodeIndex)
-    {
-        if (TreeMath.IsLeaf(nodeIndex))
-        {
-            // Blank leaf
-            var input = TlsCodec.Serialize(writer =>
-            {
-                writer.WriteUint8(1); // leaf
-                writer.WriteUint8(0); // absent
-            });
-            return cs.Hash(input);
-        }
-
-        uint left = TreeMath.Left(nodeIndex);
-        uint right = TreeMath.Right(nodeIndex);
-
-        byte[] leftHash = ComputeBlankSubtreeHash(cs, left);
-        byte[] rightHash = ComputeBlankSubtreeHash(cs, right);
-
-        var input2 = TlsCodec.Serialize(writer =>
-        {
-            writer.WriteUint8(2); // parent
-            writer.WriteUint8(0); // absent
-            writer.WriteOpaqueV(leftHash);
-            writer.WriteOpaqueV(rightHash);
-        });
-
-        return cs.Hash(input2);
     }
 
     // ---- Parent hash (RFC 9420 Section 7.9) ----
