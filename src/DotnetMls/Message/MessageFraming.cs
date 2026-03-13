@@ -299,14 +299,19 @@ public static class MessageFraming
         // } PrivateContentAAD;
         byte[] aad = BuildPrivateContentAad(content.GroupId, content.Epoch, content.ContentType, content.AuthenticatedData);
 
-        // 5. Encrypt content
-        byte[] ciphertext = cs.AeadEncrypt(key, nonce, aad, privateMessageContent);
-
-        // 6. Encrypt sender data
-        // SenderData = { leaf_index: uint32, generation: uint32, reuse_guard: opaque[4] }
-        // Per RFC 9420 Section 6.3.2, sender data includes a 4-byte reuse guard
-        // to prevent nonce reuse across epochs.
+        // 5. Generate reuse_guard and XOR with content nonce
+        // Per RFC 9420 Section 6.3.1:
+        //   content_nonce = nonce XOR [reuse_guard, 0, 0, 0, 0, 0, 0, 0, 0]
         byte[] reuseGuard = cs.RandomBytes(4);
+        byte[] contentNonce = (byte[])nonce.Clone();
+        for (int i = 0; i < 4; i++)
+            contentNonce[i] ^= reuseGuard[i];
+
+        // 6. Encrypt content with the XORed nonce
+        byte[] ciphertext = cs.AeadEncrypt(key, contentNonce, aad, privateMessageContent);
+
+        // 7. Encrypt sender data
+        // SenderData = { leaf_index: uint32, generation: uint32, reuse_guard: opaque[4] }
         byte[] senderData = TlsCodec.Serialize(writer =>
         {
             writer.WriteUint32(senderLeafIndex);
@@ -315,7 +320,7 @@ public static class MessageFraming
         });
 
         // Sender data key/nonce derived from sender_data_secret and ciphertext sample
-        // ciphertext_sample = ciphertext[0..min(AeadKeySize, len(ciphertext))]
+        // ciphertext_sample = ciphertext[0..min(Nh, len(ciphertext))]
         byte[] senderDataKey = DeriveSenderDataKey(cs, senderDataSecret, ciphertext);
         byte[] senderDataNonce = DeriveSenderDataNonce(cs, senderDataSecret, ciphertext);
 
@@ -372,23 +377,28 @@ public static class MessageFraming
         var sdReader = new TlsReader(senderData);
         uint leafIndex = sdReader.ReadUint32();
         uint generation = sdReader.ReadUint32();
-        // Remaining bytes are the reuse_guard (4 bytes); we don't need them for decryption.
+        byte[] reuseGuard = sdReader.ReadBytes(4);
 
         // 3. Get key/nonce for the sender's generation from the secret tree
         (byte[] key, byte[] nonce) = msg.ContentType == ContentType.Application
             ? secretTree.GetApplicationKeyAndNonceForGeneration(leafIndex, generation)
             : secretTree.GetHandshakeKeyAndNonceForGeneration(leafIndex, generation);
 
-        // 4. Decrypt content
-        byte[] plaintext = cs.AeadDecrypt(key, nonce, aad, msg.Ciphertext);
+        // 4. XOR reuse_guard with content nonce (same as encrypt side)
+        byte[] contentNonce = (byte[])nonce.Clone();
+        for (int i = 0; i < 4; i++)
+            contentNonce[i] ^= reuseGuard[i];
 
-        // 5. Parse PrivateMessageContent
+        // 5. Decrypt content with the XORed nonce
+        byte[] plaintext = cs.AeadDecrypt(key, contentNonce, aad, msg.Ciphertext);
+
+        // 6. Parse PrivateMessageContent
         var pmReader = new TlsReader(plaintext);
         byte[] contentBytes = pmReader.ReadOpaqueV();
         var auth = FramedContentAuthData.ReadFrom(pmReader, msg.ContentType);
         // Remaining bytes are padding (opaque<V>); discard.
 
-        // 6. Reconstruct FramedContent
+        // 7. Reconstruct FramedContent
         var content = new FramedContent
         {
             GroupId = msg.GroupId,
@@ -452,11 +462,11 @@ public static class MessageFraming
     /// sample of the content ciphertext.
     /// <para>
     /// Per RFC 9420 Section 6.3.2:
-    ///   ciphertext_sample = ciphertext[0..min(Nk, len(ciphertext))]
+    ///   ciphertext_sample = ciphertext[0..min(Nh, len(ciphertext))]
     ///   sender_data_key = ExpandWithLabel(sender_data_secret, "key", ciphertext_sample, Nk)
     /// </para>
     /// </summary>
-    private static byte[] DeriveSenderDataKey(ICipherSuite cs, byte[] senderDataSecret, byte[] ciphertext)
+    internal static byte[] DeriveSenderDataKey(ICipherSuite cs, byte[] senderDataSecret, byte[] ciphertext)
     {
         byte[] ciphertextSample = GetCiphertextSample(cs, ciphertext);
         return cs.ExpandWithLabel(senderDataSecret, "key", ciphertextSample, cs.AeadKeySize);
@@ -467,11 +477,11 @@ public static class MessageFraming
     /// sample of the content ciphertext.
     /// <para>
     /// Per RFC 9420 Section 6.3.2:
-    ///   ciphertext_sample = ciphertext[0..min(Nk, len(ciphertext))]
+    ///   ciphertext_sample = ciphertext[0..min(Nh, len(ciphertext))]
     ///   sender_data_nonce = ExpandWithLabel(sender_data_secret, "nonce", ciphertext_sample, Nn)
     /// </para>
     /// </summary>
-    private static byte[] DeriveSenderDataNonce(ICipherSuite cs, byte[] senderDataSecret, byte[] ciphertext)
+    internal static byte[] DeriveSenderDataNonce(ICipherSuite cs, byte[] senderDataSecret, byte[] ciphertext)
     {
         byte[] ciphertextSample = GetCiphertextSample(cs, ciphertext);
         return cs.ExpandWithLabel(senderDataSecret, "nonce", ciphertextSample, cs.AeadNonceSize);
@@ -479,11 +489,12 @@ public static class MessageFraming
 
     /// <summary>
     /// Extracts the ciphertext sample used for sender data key/nonce derivation.
-    /// The sample is the first min(Nk, len(ciphertext)) bytes of the ciphertext.
+    /// Per RFC 9420 Section 6.3.2, the sample is the first min(Nh, len(ciphertext))
+    /// bytes of the ciphertext, where Nh is the hash output size.
     /// </summary>
-    private static byte[] GetCiphertextSample(ICipherSuite cs, byte[] ciphertext)
+    internal static byte[] GetCiphertextSample(ICipherSuite cs, byte[] ciphertext)
     {
-        int sampleSize = Math.Min(cs.AeadKeySize, ciphertext.Length);
+        int sampleSize = Math.Min(cs.HashSize, ciphertext.Length);
         byte[] sample = new byte[sampleSize];
         Array.Copy(ciphertext, sample, sampleSize);
         return sample;

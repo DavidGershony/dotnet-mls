@@ -7,6 +7,9 @@
     <Description>Pure C# implementation of the MLS protocol (RFC 9420)</Description>
   </PropertyGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="DotnetMls.Tests" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\DotnetMls.Crypto\DotnetMls.Crypto.csproj" />
   </ItemGroup>
 </Project>

@@ -3,6 +3,7 @@ using System.Text.Json.Serialization;
 using DotnetMls.Codec;
 using DotnetMls.Crypto;
 using DotnetMls.KeySchedule;
+using DotnetMls.Message;
 using DotnetMls.Tree;
 using DotnetMls.Types;
 using Xunit;
@@ -807,5 +808,59 @@ public class Rfc9420TestVectorTests
         var actual = PskSecretDerivation.ComputePskSecret(cs, pskInputs);
 
         Assert.Equal(expected, actual);
+    }
+
+    // ================================================================
+    // Sender Data Key Derivation — Production Code Path (Bug Regression)
+    // ================================================================
+
+    /// <summary>
+    /// Validates that the production MessageFraming.DeriveSenderDataKey/Nonce
+    /// (which call GetCiphertextSample internally) produce the same results as
+    /// the test vector. This catches Bug 1 where GetCiphertextSample used
+    /// AeadKeySize (Nk=16) instead of HashSize (Nh=32).
+    /// </summary>
+    [Fact]
+    public void SenderDataKey_ProductionCodePath_MatchesOfficialVectors()
+    {
+        var vectors = JsonSerializer.Deserialize<SecretTreeVector[]>(
+            File.ReadAllText(VectorPath("secret-tree.json")), JsonOpts)!;
+
+        var v = vectors.First(x => x.CipherSuite == 1);
+        var cs = new CipherSuite0x0001();
+
+        byte[] senderDataSecret = Hex(v.SenderData.SenderDataSecret);
+        byte[] ciphertext = Hex(v.SenderData.Ciphertext);
+
+        // Call the PRODUCTION code path (not manual inline computation)
+        byte[] key = MessageFraming.DeriveSenderDataKey(cs, senderDataSecret, ciphertext);
+        byte[] nonce = MessageFraming.DeriveSenderDataNonce(cs, senderDataSecret, ciphertext);
+
+        Assert.Equal(Hex(v.SenderData.Key), key);
+        Assert.Equal(Hex(v.SenderData.Nonce), nonce);
+    }
+
+    /// <summary>
+    /// Validates that GetCiphertextSample takes min(Nh, len(ciphertext)) bytes,
+    /// not min(Nk, len(ciphertext)). For CipherSuite 1 (AES-128-GCM + SHA-256):
+    /// Nh=32, Nk=16. With ciphertext longer than 32 bytes, the sample must be 32 bytes.
+    /// </summary>
+    [Fact]
+    public void GetCiphertextSample_UsesHashSize_NotAeadKeySize()
+    {
+        var cs = new CipherSuite0x0001();
+        // Nh=32, Nk=16 for CipherSuite 1
+        Assert.Equal(32, cs.HashSize);
+        Assert.Equal(16, cs.AeadKeySize);
+
+        // Ciphertext longer than both Nh and Nk
+        var ciphertext = new byte[64];
+        for (int i = 0; i < ciphertext.Length; i++) ciphertext[i] = (byte)i;
+
+        byte[] sample = MessageFraming.GetCiphertextSample(cs, ciphertext);
+
+        // Must be Nh=32 bytes, not Nk=16
+        Assert.Equal(cs.HashSize, sample.Length);
+        Assert.Equal(ciphertext[..32], sample);
     }
 }
