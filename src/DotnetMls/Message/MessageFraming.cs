@@ -285,7 +285,12 @@ public static class MessageFraming
         // } PrivateMessageContent;
         byte[] privateMessageContent = TlsCodec.Serialize(writer =>
         {
-            writer.WriteOpaqueV(content.Content);
+            // Per RFC 9420 Section 6.3.1: application data is VarInt-prefixed,
+            // but proposal/commit are raw struct bytes (no length prefix)
+            if (content.ContentType == ContentType.Application)
+                writer.WriteOpaqueV(content.Content);
+            else
+                writer.WriteBytes(content.Content);
             auth.WriteTo(writer, content.ContentType);
             writer.WriteOpaqueV(padding);
         });
@@ -324,7 +329,9 @@ public static class MessageFraming
         byte[] senderDataKey = DeriveSenderDataKey(cs, senderDataSecret, ciphertext);
         byte[] senderDataNonce = DeriveSenderDataNonce(cs, senderDataSecret, ciphertext);
 
-        byte[] encryptedSenderData = cs.AeadEncrypt(senderDataKey, senderDataNonce, aad, senderData);
+        // Sender data AAD is group_id + epoch + content_type (no authenticated_data)
+        byte[] senderDataAad = BuildSenderDataAad(content.GroupId, content.Epoch, content.ContentType);
+        byte[] encryptedSenderData = cs.AeadEncrypt(senderDataKey, senderDataNonce, senderDataAad, senderData);
 
         return new PrivateMessage
         {
@@ -365,14 +372,17 @@ public static class MessageFraming
         SecretTree secretTree,
         byte[] senderDataSecret)
     {
-        // 1. Build AAD (needed for both sender data and content decryption)
+        // 1. Build AADs
+        // Sender data AAD: group_id + epoch + content_type (no authenticated_data)
+        byte[] senderDataAad = BuildSenderDataAad(msg.GroupId, msg.Epoch, msg.ContentType);
+        // Content AAD: full PrivateContentAAD including authenticated_data
         byte[] aad = BuildPrivateContentAad(msg.GroupId, msg.Epoch, msg.ContentType, msg.AuthenticatedData);
 
         // 2. Decrypt sender data to get leaf_index, generation, and reuse_guard
         byte[] senderDataKey = DeriveSenderDataKey(cs, senderDataSecret, msg.Ciphertext);
         byte[] senderDataNonce = DeriveSenderDataNonce(cs, senderDataSecret, msg.Ciphertext);
 
-        byte[] senderData = cs.AeadDecrypt(senderDataKey, senderDataNonce, aad, msg.EncryptedSenderData);
+        byte[] senderData = cs.AeadDecrypt(senderDataKey, senderDataNonce, senderDataAad, msg.EncryptedSenderData);
 
         var sdReader = new TlsReader(senderData);
         uint leafIndex = sdReader.ReadUint32();
@@ -394,7 +404,23 @@ public static class MessageFraming
 
         // 6. Parse PrivateMessageContent
         var pmReader = new TlsReader(plaintext);
-        byte[] contentBytes = pmReader.ReadOpaqueV();
+        byte[] contentBytes;
+        if (msg.ContentType == ContentType.Application)
+        {
+            // application_data<V> is VarInt-length-prefixed
+            contentBytes = pmReader.ReadOpaqueV();
+        }
+        else
+        {
+            // Proposal/Commit are raw structs — parse to find the boundary, then extract bytes
+            int startPos = pmReader.Position;
+            if (msg.ContentType == ContentType.Proposal)
+                Proposal.ReadFrom(pmReader);
+            else
+                Commit.ReadFrom(pmReader);
+            int consumed = pmReader.Position - startPos;
+            contentBytes = plaintext[startPos..pmReader.Position];
+        }
         var auth = FramedContentAuthData.ReadFrom(pmReader, msg.ContentType);
         // Remaining bytes are padding (opaque<V>); discard.
 
@@ -454,6 +480,24 @@ public static class MessageFraming
             writer.WriteUint64(epoch);
             writer.WriteUint8((byte)contentType);
             writer.WriteOpaqueV(authenticatedData);
+        });
+    }
+
+    /// <summary>
+    /// Builds the SenderDataAAD structure used as additional authenticated data
+    /// for sender data encryption/decryption. Per RFC 9420 Section 6.3.2, this
+    /// contains only group_id, epoch, and content_type (no authenticated_data).
+    /// </summary>
+    private static byte[] BuildSenderDataAad(
+        byte[] groupId,
+        ulong epoch,
+        ContentType contentType)
+    {
+        return TlsCodec.Serialize(writer =>
+        {
+            writer.WriteOpaqueV(groupId);
+            writer.WriteUint64(epoch);
+            writer.WriteUint8((byte)contentType);
         });
     }
 

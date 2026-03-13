@@ -33,6 +33,9 @@ public abstract class Proposal
             (ushort)ProposalType.Add => AddProposal.ReadBody(reader),
             (ushort)ProposalType.Update => UpdateProposal.ReadBody(reader),
             (ushort)ProposalType.Remove => RemoveProposal.ReadBody(reader),
+            (ushort)ProposalType.PreSharedKey => PreSharedKeyProposal.ReadBody(reader),
+            (ushort)ProposalType.ReInit => ReInitProposal.ReadBody(reader),
+            (ushort)ProposalType.ExternalInit => ExternalInitProposal.ReadBody(reader),
             (ushort)ProposalType.GroupContextExtensions => GroupContextExtensionsProposal.ReadBody(reader),
             _ => throw new TlsDecodingException($"Unknown ProposalType: {rawType}"),
         };
@@ -210,5 +213,135 @@ public sealed class GroupContextExtensionsProposal : Proposal
             list.Add(Extension.ReadFrom(extReader));
         }
         return new GroupContextExtensionsProposal(list.ToArray());
+    }
+}
+
+/// <summary>
+/// A PreSharedKey proposal (RFC 9420 Section 12.1.4).
+/// </summary>
+public sealed class PreSharedKeyProposal : Proposal
+{
+    public override ProposalType ProposalType => ProposalType.PreSharedKey;
+
+    public PreSharedKeyId Psk { get; set; } = new PreSharedKeyId();
+
+    public PreSharedKeyProposal()
+    {
+    }
+
+    public PreSharedKeyProposal(PreSharedKeyId psk)
+    {
+        Psk = psk;
+    }
+
+    public override void WriteTo(TlsWriter writer)
+    {
+        writer.WriteUint16((ushort)ProposalType);
+        WriteBody(writer);
+    }
+
+    protected override void WriteBody(TlsWriter writer)
+    {
+        Psk.WriteTo(writer);
+    }
+
+    internal static PreSharedKeyProposal ReadBody(TlsReader reader)
+    {
+        var psk = PreSharedKeyId.ReadFrom(reader);
+        return new PreSharedKeyProposal(psk);
+    }
+}
+
+/// <summary>
+/// A ReInit proposal (RFC 9420 Section 12.1.5).
+/// </summary>
+public sealed class ReInitProposal : Proposal
+{
+    public override ProposalType ProposalType => ProposalType.ReInit;
+
+    public byte[] GroupId { get; set; } = Array.Empty<byte>();
+    public ushort Version { get; set; }
+    public ushort CipherSuite { get; set; }
+    public Extension[] Extensions { get; set; } = Array.Empty<Extension>();
+
+    public ReInitProposal()
+    {
+    }
+
+    public override void WriteTo(TlsWriter writer)
+    {
+        writer.WriteUint16((ushort)ProposalType);
+        WriteBody(writer);
+    }
+
+    protected override void WriteBody(TlsWriter writer)
+    {
+        writer.WriteOpaqueV(GroupId);
+        writer.WriteUint16(Version);
+        writer.WriteUint16(CipherSuite);
+        writer.WriteVectorV(inner =>
+        {
+            foreach (var ext in Extensions)
+            {
+                ext.WriteTo(inner);
+            }
+        });
+    }
+
+    internal static ReInitProposal ReadBody(TlsReader reader)
+    {
+        var p = new ReInitProposal();
+        p.GroupId = reader.ReadOpaqueV();
+        p.Version = reader.ReadUint16();
+        p.CipherSuite = reader.ReadUint16();
+
+        byte[] extData = reader.ReadOpaqueV();
+        if (extData.Length > 0)
+        {
+            var extReader = new TlsReader(extData);
+            var list = new List<Extension>();
+            while (!extReader.IsEmpty)
+            {
+                list.Add(Extension.ReadFrom(extReader));
+            }
+            p.Extensions = list.ToArray();
+        }
+        return p;
+    }
+}
+
+/// <summary>
+/// An ExternalInit proposal (RFC 9420 Section 12.1.6).
+/// </summary>
+public sealed class ExternalInitProposal : Proposal
+{
+    public override ProposalType ProposalType => ProposalType.ExternalInit;
+
+    public byte[] KemOutput { get; set; } = Array.Empty<byte>();
+
+    public ExternalInitProposal()
+    {
+    }
+
+    public ExternalInitProposal(byte[] kemOutput)
+    {
+        KemOutput = kemOutput;
+    }
+
+    public override void WriteTo(TlsWriter writer)
+    {
+        writer.WriteUint16((ushort)ProposalType);
+        WriteBody(writer);
+    }
+
+    protected override void WriteBody(TlsWriter writer)
+    {
+        writer.WriteOpaqueV(KemOutput);
+    }
+
+    internal static ExternalInitProposal ReadBody(TlsReader reader)
+    {
+        var kemOutput = reader.ReadOpaqueV();
+        return new ExternalInitProposal(kemOutput);
     }
 }

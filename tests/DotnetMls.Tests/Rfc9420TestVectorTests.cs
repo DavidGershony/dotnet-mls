@@ -863,4 +863,178 @@ public class Rfc9420TestVectorTests
         Assert.Equal(cs.HashSize, sample.Length);
         Assert.Equal(ciphertext[..32], sample);
     }
+
+    // ================================================================
+    // Message Protection Test Vectors (RFC 9420 Section 13.3)
+    // ================================================================
+
+    public class MessageProtectionVector
+    {
+        [JsonPropertyName("cipher_suite")]
+        public int CipherSuite { get; set; }
+
+        [JsonPropertyName("group_id")]
+        public string GroupId { get; set; } = "";
+
+        [JsonPropertyName("epoch")]
+        public ulong Epoch { get; set; }
+
+        [JsonPropertyName("tree_hash")]
+        public string TreeHash { get; set; } = "";
+
+        [JsonPropertyName("confirmed_transcript_hash")]
+        public string ConfirmedTranscriptHash { get; set; } = "";
+
+        [JsonPropertyName("signature_priv")]
+        public string SignaturePriv { get; set; } = "";
+
+        [JsonPropertyName("signature_pub")]
+        public string SignaturePub { get; set; } = "";
+
+        [JsonPropertyName("encryption_secret")]
+        public string EncryptionSecret { get; set; } = "";
+
+        [JsonPropertyName("sender_data_secret")]
+        public string SenderDataSecret { get; set; } = "";
+
+        [JsonPropertyName("membership_key")]
+        public string MembershipKey { get; set; } = "";
+
+        [JsonPropertyName("proposal")]
+        public string Proposal { get; set; } = "";
+
+        [JsonPropertyName("proposal_priv")]
+        public string ProposalPriv { get; set; } = "";
+
+        [JsonPropertyName("proposal_pub")]
+        public string ProposalPub { get; set; } = "";
+
+        [JsonPropertyName("commit")]
+        public string Commit { get; set; } = "";
+
+        [JsonPropertyName("commit_priv")]
+        public string CommitPriv { get; set; } = "";
+
+        [JsonPropertyName("commit_pub")]
+        public string CommitPub { get; set; } = "";
+
+        [JsonPropertyName("application")]
+        public string Application { get; set; } = "";
+
+        [JsonPropertyName("application_priv")]
+        public string ApplicationPriv { get; set; } = "";
+    }
+
+    /// <summary>
+    /// Decrypts PrivateMessage test vectors from the official RFC 9420 message-protection
+    /// test vectors. This validates the full production code path including:
+    /// - GetCiphertextSample (must use Nh, not Nk)
+    /// - DeriveSenderDataKey/Nonce
+    /// - reuse_guard XOR with content nonce
+    /// - AEAD decrypt of content
+    /// </summary>
+    [Fact]
+    public void MessageProtection_DecryptPrivateMessage_Application_MatchesOfficialVectors()
+    {
+        var vectors = JsonSerializer.Deserialize<MessageProtectionVector[]>(
+            File.ReadAllText(VectorPath("message-protection.json")), JsonOpts)!;
+
+        var v = vectors.First(x => x.CipherSuite == 1);
+        var cs = new CipherSuite0x0001();
+
+        // Parse the PrivateMessage from the MLSMessage envelope
+        var mlsMsg = MlsMessage.ReadFrom(new TlsReader(Hex(v.ApplicationPriv)));
+        Assert.Equal(WireFormat.MlsPrivateMessage, mlsMsg.WireFormat);
+        var privateMsg = (PrivateMessage)mlsMsg.Body;
+
+        // Verify the parsed message matches expected group context
+        Assert.Equal(Hex(v.GroupId), privateMsg.GroupId);
+        Assert.Equal(v.Epoch, privateMsg.Epoch);
+        Assert.Equal(ContentType.Application, privateMsg.ContentType);
+
+        // Build the SecretTree from the encryption secret (2-member group per RFC 13.3)
+        var secretTree = new SecretTree(cs, Hex(v.EncryptionSecret), 2);
+
+        // Decrypt using the production code path
+        var (content, auth) = MessageFraming.DecryptPrivateMessage(
+            privateMsg, cs, secretTree, Hex(v.SenderDataSecret));
+
+        // The decrypted content bytes should match the application plaintext
+        Assert.Equal(Hex(v.Application), content.Content);
+        Assert.Equal(ContentType.Application, content.ContentType);
+        Assert.Equal(Hex(v.GroupId), content.GroupId);
+        Assert.Equal(v.Epoch, content.Epoch);
+
+        // Verify the signature using the test vector's signing public key
+        var groupContext = new GroupContext
+        {
+            Version = ProtocolVersion.Mls10,
+            CipherSuite = (ushort)v.CipherSuite,
+            GroupId = Hex(v.GroupId),
+            Epoch = v.Epoch,
+            TreeHash = Hex(v.TreeHash),
+            ConfirmedTranscriptHash = Hex(v.ConfirmedTranscriptHash),
+            Extensions = Array.Empty<Extension>()
+        };
+        byte[] serializedGroupContext = TlsCodec.Serialize(w => groupContext.WriteTo(w));
+
+        bool sigValid = MessageFraming.VerifyPrivateMessageSignature(
+            content, auth, Hex(v.SignaturePub), serializedGroupContext, cs);
+        Assert.True(sigValid, "Signature verification failed on decrypted PrivateMessage");
+    }
+
+    /// <summary>
+    /// Decrypts the proposal PrivateMessage test vector.
+    /// </summary>
+    [Fact]
+    public void MessageProtection_DecryptPrivateMessage_Proposal_MatchesOfficialVectors()
+    {
+        var vectors = JsonSerializer.Deserialize<MessageProtectionVector[]>(
+            File.ReadAllText(VectorPath("message-protection.json")), JsonOpts)!;
+
+        var v = vectors.First(x => x.CipherSuite == 1);
+        var cs = new CipherSuite0x0001();
+
+        var mlsMsg = MlsMessage.ReadFrom(new TlsReader(Hex(v.ProposalPriv)));
+        Assert.Equal(WireFormat.MlsPrivateMessage, mlsMsg.WireFormat);
+        var privateMsg = (PrivateMessage)mlsMsg.Body;
+
+        Assert.Equal(ContentType.Proposal, privateMsg.ContentType);
+
+        var secretTree = new SecretTree(cs, Hex(v.EncryptionSecret), 2);
+
+        var (content, auth) = MessageFraming.DecryptPrivateMessage(
+            privateMsg, cs, secretTree, Hex(v.SenderDataSecret));
+
+        Assert.Equal(Hex(v.Proposal), content.Content);
+        Assert.Equal(ContentType.Proposal, content.ContentType);
+    }
+
+    /// <summary>
+    /// Decrypts the commit PrivateMessage test vector.
+    /// </summary>
+    [Fact]
+    public void MessageProtection_DecryptPrivateMessage_Commit_MatchesOfficialVectors()
+    {
+        var vectors = JsonSerializer.Deserialize<MessageProtectionVector[]>(
+            File.ReadAllText(VectorPath("message-protection.json")), JsonOpts)!;
+
+        var v = vectors.First(x => x.CipherSuite == 1);
+        var cs = new CipherSuite0x0001();
+
+        var mlsMsg = MlsMessage.ReadFrom(new TlsReader(Hex(v.CommitPriv)));
+        Assert.Equal(WireFormat.MlsPrivateMessage, mlsMsg.WireFormat);
+        var privateMsg = (PrivateMessage)mlsMsg.Body;
+
+        Assert.Equal(ContentType.Commit, privateMsg.ContentType);
+
+        var secretTree = new SecretTree(cs, Hex(v.EncryptionSecret), 2);
+
+        var (content, auth) = MessageFraming.DecryptPrivateMessage(
+            privateMsg, cs, secretTree, Hex(v.SenderDataSecret));
+
+        Assert.Equal(Hex(v.Commit), content.Content);
+        Assert.Equal(ContentType.Commit, content.ContentType);
+    }
+
 }
