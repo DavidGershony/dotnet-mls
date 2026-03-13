@@ -329,6 +329,18 @@ public sealed class TlsReader
     }
 
     /// <summary>
+    /// Returns bytes from the internal buffer between the given start position and current position.
+    /// Useful after parsing a variable-length struct to extract the consumed raw bytes.
+    /// </summary>
+    internal byte[] GetRange(int fromPosition)
+    {
+        int length = _position - fromPosition;
+        var result = new byte[length];
+        Array.Copy(_data, _offset + fromPosition, result, 0, length);
+        return result;
+    }
+
+    /// <summary>
     /// Creates a sub-reader over the next <paramref name="length"/> bytes and advances the current position.
     /// </summary>
     /// <param name="length">The number of bytes for the sub-reader.</param>

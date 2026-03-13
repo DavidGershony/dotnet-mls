@@ -1037,4 +1037,294 @@ public class Rfc9420TestVectorTests
         Assert.Equal(ContentType.Commit, content.ContentType);
     }
 
+    // ================================================================
+    // Welcome Test Vectors (RFC 9420 Section 13.7)
+    // ================================================================
+
+    public class WelcomeVector
+    {
+        [JsonPropertyName("cipher_suite")]
+        public int CipherSuite { get; set; }
+
+        [JsonPropertyName("init_priv")]
+        public string InitPriv { get; set; } = "";
+
+        [JsonPropertyName("key_package")]
+        public string KeyPackage { get; set; } = "";
+
+        [JsonPropertyName("signer_pub")]
+        public string SignerPub { get; set; } = "";
+
+        [JsonPropertyName("welcome")]
+        public string Welcome { get; set; } = "";
+    }
+
+    /// <summary>
+    /// Processes a Welcome message from official test vectors:
+    /// parses KeyPackage, finds matching EncryptedGroupSecrets,
+    /// HPKE-decrypts GroupSecrets, derives welcome key/nonce,
+    /// decrypts GroupInfo, and verifies the GroupInfo signature.
+    /// </summary>
+    [Fact]
+    public void Welcome_ProcessWelcome_MatchesOfficialVectors()
+    {
+        var vectors = JsonSerializer.Deserialize<WelcomeVector[]>(
+            File.ReadAllText(VectorPath("welcome.json")), JsonOpts)!;
+
+        var v = vectors.First(x => x.CipherSuite == 1);
+        var cs = new CipherSuite0x0001();
+
+        // Parse the MLSMessage-wrapped KeyPackage
+        var kpMsg = MlsMessage.ReadFrom(new TlsReader(Hex(v.KeyPackage)));
+        Assert.Equal(WireFormat.MlsKeyPackage, kpMsg.WireFormat);
+        var keyPackage = (KeyPackage)kpMsg.Body;
+
+        // Parse the MLSMessage-wrapped Welcome
+        var welcomeMsg = MlsMessage.ReadFrom(new TlsReader(Hex(v.Welcome)));
+        Assert.Equal(WireFormat.MlsWelcome, welcomeMsg.WireFormat);
+        var welcome = (Welcome)welcomeMsg.Body;
+
+        Assert.Equal(1, welcome.CipherSuite);
+
+        // Compute KeyPackageRef and find our EncryptedGroupSecrets
+        byte[] kpBytes = TlsCodec.Serialize(w => keyPackage.WriteTo(w));
+        var kpRef = KeyPackageRef.Compute(cs, kpBytes);
+
+        EncryptedGroupSecrets? mySecrets = null;
+        foreach (var egs in welcome.Secrets)
+        {
+            if (egs.NewMember.AsSpan().SequenceEqual(kpRef.Value))
+            {
+                mySecrets = egs;
+                break;
+            }
+        }
+        Assert.NotNull(mySecrets);
+
+        // HPKE decrypt GroupSecrets using init private key
+        byte[] hpkeInfo = TlsCodec.Serialize(w =>
+        {
+            byte[] fullLabel = System.Text.Encoding.ASCII.GetBytes("MLS 1.0 Welcome");
+            w.WriteOpaqueV(fullLabel);
+            w.WriteOpaqueV(welcome.EncryptedGroupInfo);
+        });
+
+        byte[] groupSecretsBytes = cs.HpkeOpen(
+            Hex(v.InitPriv),
+            mySecrets.EncryptedGroupSecretsValue.KemOutput,
+            hpkeInfo,
+            Array.Empty<byte>(),
+            mySecrets.EncryptedGroupSecretsValue.Ciphertext);
+
+        var groupSecrets = GroupSecrets.ReadFrom(new TlsReader(groupSecretsBytes));
+        Assert.NotNull(groupSecrets.JoinerSecret);
+        Assert.True(groupSecrets.JoinerSecret.Length > 0);
+
+        // Derive welcome_secret and decrypt GroupInfo
+        byte[] pskSecret = new byte[cs.SecretSize]; // zeros when no PSKs
+        byte[] intermediateSecret = cs.Extract(groupSecrets.JoinerSecret, pskSecret);
+        byte[] welcomeSecret = cs.DeriveSecret(intermediateSecret, "welcome");
+        byte[] welcomeKey = cs.ExpandWithLabel(
+            welcomeSecret, "key", Array.Empty<byte>(), cs.AeadKeySize);
+        byte[] welcomeNonce = cs.ExpandWithLabel(
+            welcomeSecret, "nonce", Array.Empty<byte>(), cs.AeadNonceSize);
+
+        byte[] groupInfoBytes = cs.AeadDecrypt(
+            welcomeKey, welcomeNonce, Array.Empty<byte>(), welcome.EncryptedGroupInfo);
+
+        var groupInfo = GroupInfo.ReadFrom(new TlsReader(groupInfoBytes));
+
+        // Verify GroupInfo fields
+        Assert.Equal(ProtocolVersion.Mls10, groupInfo.GroupContext.Version);
+        Assert.Equal((ushort)1, groupInfo.GroupContext.CipherSuite);
+
+        // Verify the GroupInfo signature using the signer's public key
+        byte[] groupInfoTbs = TlsCodec.Serialize(w =>
+        {
+            // GroupInfoTBS = GroupContext || extensions || confirmation_tag
+            groupInfo.GroupContext.WriteTo(w);
+            w.WriteVectorV(inner =>
+            {
+                foreach (var ext in groupInfo.Extensions)
+                    ext.WriteTo(inner);
+            });
+            w.WriteOpaqueV(groupInfo.ConfirmationTag);
+            w.WriteUint32(groupInfo.Signer);
+        });
+
+        bool sigValid = cs.VerifyWithLabel(
+            Hex(v.SignerPub), "GroupInfoTBS", groupInfoTbs, groupInfo.Signature);
+        Assert.True(sigValid, "GroupInfo signature verification failed");
+    }
+
+    // ================================================================
+    // Messages Test Vectors (RFC 9420 Section 13.10)
+    // ================================================================
+
+    public class MessagesVector
+    {
+        [JsonPropertyName("mls_welcome")]
+        public string MlsWelcome { get; set; } = "";
+
+        [JsonPropertyName("mls_group_info")]
+        public string MlsGroupInfo { get; set; } = "";
+
+        [JsonPropertyName("mls_key_package")]
+        public string MlsKeyPackage { get; set; } = "";
+
+        [JsonPropertyName("ratchet_tree")]
+        public string RatchetTree { get; set; } = "";
+
+        [JsonPropertyName("group_secrets")]
+        public string GroupSecrets { get; set; } = "";
+
+        [JsonPropertyName("add_proposal")]
+        public string AddProposal { get; set; } = "";
+
+        [JsonPropertyName("update_proposal")]
+        public string UpdateProposal { get; set; } = "";
+
+        [JsonPropertyName("remove_proposal")]
+        public string RemoveProposal { get; set; } = "";
+
+        [JsonPropertyName("pre_shared_key_proposal")]
+        public string PreSharedKeyProposal { get; set; } = "";
+
+        [JsonPropertyName("re_init_proposal")]
+        public string ReInitProposal { get; set; } = "";
+
+        [JsonPropertyName("external_init_proposal")]
+        public string ExternalInitProposal { get; set; } = "";
+
+        [JsonPropertyName("group_context_extensions_proposal")]
+        public string GroupContextExtensionsProposal { get; set; } = "";
+
+        [JsonPropertyName("commit")]
+        public string CommitMsg { get; set; } = "";
+
+        [JsonPropertyName("public_message_application")]
+        public string PublicMessageApplication { get; set; } = "";
+
+        [JsonPropertyName("public_message_proposal")]
+        public string PublicMessageProposal { get; set; } = "";
+
+        [JsonPropertyName("public_message_commit")]
+        public string PublicMessageCommit { get; set; } = "";
+
+        [JsonPropertyName("private_message")]
+        public string PrivateMessage { get; set; } = "";
+    }
+
+    /// <summary>
+    /// Round-trip test for MLSMessage-wrapped types: deserialize then re-serialize
+    /// and verify the bytes match exactly.
+    /// </summary>
+    [Fact]
+    public void Messages_MlsMessageRoundTrip_MatchesOfficialVectors()
+    {
+        var vectors = JsonSerializer.Deserialize<MessagesVector[]>(
+            File.ReadAllText(VectorPath("messages.json")), JsonOpts)!;
+
+        // Test the first entry
+        var v = vectors[0];
+
+        // MLSMessage-wrapped Welcome
+        AssertMlsMessageRoundTrip(v.MlsWelcome, "mls_welcome");
+
+        // MLSMessage-wrapped GroupInfo
+        AssertMlsMessageRoundTrip(v.MlsGroupInfo, "mls_group_info");
+
+        // MLSMessage-wrapped KeyPackage
+        AssertMlsMessageRoundTrip(v.MlsKeyPackage, "mls_key_package");
+
+        // MLSMessage-wrapped PublicMessage (application)
+        AssertMlsMessageRoundTrip(v.PublicMessageApplication, "public_message_application");
+
+        // MLSMessage-wrapped PublicMessage (proposal)
+        AssertMlsMessageRoundTrip(v.PublicMessageProposal, "public_message_proposal");
+
+        // MLSMessage-wrapped PublicMessage (commit)
+        AssertMlsMessageRoundTrip(v.PublicMessageCommit, "public_message_commit");
+
+        // MLSMessage-wrapped PrivateMessage
+        AssertMlsMessageRoundTrip(v.PrivateMessage, "private_message");
+    }
+
+    private static void AssertMlsMessageRoundTrip(string hex, string label)
+    {
+        byte[] original = Hex(hex);
+        var msg = MlsMessage.ReadFrom(new TlsReader(original));
+        byte[] reserialized = TlsCodec.Serialize(w => msg.WriteTo(w));
+        Assert.True(original.SequenceEqual(reserialized),
+            $"Round-trip mismatch for {label}: " +
+            $"expected {original.Length} bytes, got {reserialized.Length} bytes");
+    }
+
+    /// <summary>
+    /// Round-trip test for raw (non-MLSMessage-wrapped) types:
+    /// GroupSecrets, RatchetTree, Proposals, Commit.
+    /// Proposals in messages.json are body-only (no type tag).
+    /// </summary>
+    [Fact]
+    public void Messages_RawTypeRoundTrip_MatchesOfficialVectors()
+    {
+        var vectors = JsonSerializer.Deserialize<MessagesVector[]>(
+            File.ReadAllText(VectorPath("messages.json")), JsonOpts)!;
+
+        var v = vectors[0];
+
+        // GroupSecrets
+        {
+            byte[] original = Hex(v.GroupSecrets);
+            var gs = Types.GroupSecrets.ReadFrom(new TlsReader(original));
+            byte[] reserialized = TlsCodec.Serialize(w => gs.WriteTo(w));
+            Assert.Equal(original, reserialized);
+        }
+
+        // RatchetTree (VarInt-prefixed opaque vector)
+        {
+            byte[] original = Hex(v.RatchetTree);
+            var tree = Tree.RatchetTree.ReadFrom(new TlsReader(original));
+            byte[] reserialized = TlsCodec.Serialize(w => tree.WriteTo(w));
+            Assert.True(original.SequenceEqual(reserialized),
+                $"Round-trip mismatch for ratchet_tree");
+        }
+
+        // Proposals — body only (no type tag), so we prepend the type tag
+        // for ReadFrom, then compare the full output including type tag
+        AssertProposalBodyRoundTrip(v.AddProposal, ProposalType.Add, "add_proposal");
+        AssertProposalBodyRoundTrip(v.UpdateProposal, ProposalType.Update, "update_proposal");
+        AssertProposalBodyRoundTrip(v.RemoveProposal, ProposalType.Remove, "remove_proposal");
+        AssertProposalBodyRoundTrip(v.PreSharedKeyProposal, ProposalType.PreSharedKey, "pre_shared_key_proposal");
+        AssertProposalBodyRoundTrip(v.ReInitProposal, ProposalType.ReInit, "re_init_proposal");
+        AssertProposalBodyRoundTrip(v.ExternalInitProposal, ProposalType.ExternalInit, "external_init_proposal");
+        AssertProposalBodyRoundTrip(v.GroupContextExtensionsProposal, ProposalType.GroupContextExtensions, "group_context_extensions_proposal");
+
+        // Commit
+        {
+            byte[] original = Hex(v.CommitMsg);
+            var commit = Types.Commit.ReadFrom(new TlsReader(original));
+            byte[] reserialized = TlsCodec.Serialize(w => commit.WriteTo(w));
+            Assert.Equal(original, reserialized);
+        }
+    }
+
+    private static void AssertProposalBodyRoundTrip(string bodyHex, ProposalType type, string label)
+    {
+        byte[] bodyOriginal = Hex(bodyHex);
+
+        // Prepend the 2-byte type tag so Proposal.ReadFrom can parse it
+        byte[] withTag = new byte[2 + bodyOriginal.Length];
+        withTag[0] = (byte)((ushort)type >> 8);
+        withTag[1] = (byte)((ushort)type & 0xFF);
+        Buffer.BlockCopy(bodyOriginal, 0, withTag, 2, bodyOriginal.Length);
+
+        var proposal = Types.Proposal.ReadFrom(new TlsReader(withTag));
+        byte[] reserialized = TlsCodec.Serialize(w => proposal.WriteTo(w));
+
+        Assert.True(withTag.SequenceEqual(reserialized),
+            $"Round-trip mismatch for {label}: " +
+            $"expected {Convert.ToHexString(withTag)}, got {Convert.ToHexString(reserialized)}");
+    }
+
 }

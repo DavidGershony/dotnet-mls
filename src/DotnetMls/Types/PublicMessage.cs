@@ -39,9 +39,8 @@ public sealed class PublicMessage
         Content.WriteTo(writer);
         Auth.WriteTo(writer, Content.ContentType);
 
-        // membership_tag is present for member senders on non-proposal content
-        if (Content.Sender.SenderType == SenderType.Member &&
-            Content.ContentType != ContentType.Proposal)
+        // RFC 9420 §6.2: membership_tag is present for all member senders
+        if (Content.Sender.SenderType == SenderType.Member)
         {
             writer.WriteOpaqueV(MembershipTag ?? Array.Empty<byte>());
         }
@@ -52,9 +51,9 @@ public sealed class PublicMessage
         var content = FramedContent.ReadFrom(reader);
         var auth = FramedContentAuthData.ReadFrom(reader, content.ContentType);
 
+        // RFC 9420 §6.2: membership_tag is present for all member senders
         byte[]? membershipTag = null;
-        if (content.Sender.SenderType == SenderType.Member &&
-            content.ContentType != ContentType.Proposal)
+        if (content.Sender.SenderType == SenderType.Member)
         {
             membershipTag = reader.ReadOpaqueV();
         }

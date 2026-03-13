@@ -49,7 +49,13 @@ public sealed class FramedContent
         Sender.WriteTo(writer);
         writer.WriteOpaqueV(AuthenticatedData);
         writer.WriteUint8((byte)ContentType);
-        writer.WriteOpaqueV(Content);
+
+        // RFC 9420 §6: application_data is opaque<V>, but Proposal and Commit
+        // are raw TLS structs (no VarInt prefix).
+        if (ContentType == ContentType.Application)
+            writer.WriteOpaqueV(Content);
+        else
+            writer.WriteBytes(Content);
     }
 
     public static FramedContent ReadFrom(TlsReader reader)
@@ -60,7 +66,22 @@ public sealed class FramedContent
         fc.Sender = Sender.ReadFrom(reader);
         fc.AuthenticatedData = reader.ReadOpaqueV();
         fc.ContentType = ContentTypeExtensions.ReadContentType(reader);
-        fc.Content = reader.ReadOpaqueV();
+
+        // RFC 9420 §6: application_data is opaque<V>, but Proposal and Commit
+        // are raw TLS structs parsed by their ReadFrom methods.
+        if (fc.ContentType == ContentType.Application)
+        {
+            fc.Content = reader.ReadOpaqueV();
+        }
+        else
+        {
+            int startPos = reader.Position;
+            if (fc.ContentType == ContentType.Proposal)
+                Proposal.ReadFrom(reader);
+            else
+                Commit.ReadFrom(reader);
+            fc.Content = reader.GetRange(startPos);
+        }
         return fc;
     }
 }

@@ -869,7 +869,7 @@ public sealed class MlsGroup
             {
                 JoinerSecret = keySchedule.JoinerSecret,
                 PathSecret = null, // Path secret is for tree reconstruction; omitted for simplicity
-                Psks = null
+                Psks = Array.Empty<PreSharedKeyId>()
             };
 
             byte[] gsBytes = TlsCodec.Serialize(writer => groupSecrets.WriteTo(writer));

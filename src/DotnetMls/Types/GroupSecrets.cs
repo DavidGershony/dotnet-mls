@@ -19,9 +19,9 @@ public sealed class GroupSecrets
     public byte[]? PathSecret { get; set; }
 
     /// <summary>
-    /// Optional pre-shared key identifiers.
+    /// Pre-shared key identifiers (RFC 9420 §12.4.3.1: PreSharedKeyID psks&lt;V&gt;).
     /// </summary>
-    public PreSharedKeyId[]? Psks { get; set; }
+    public PreSharedKeyId[] Psks { get; set; } = Array.Empty<PreSharedKeyId>();
 
     public GroupSecrets()
     {
@@ -42,22 +42,14 @@ public sealed class GroupSecrets
             writer.WriteUint8(0);
         }
 
-        // optional psks
-        if (Psks != null)
+        // psks<V> — vector (not optional) per RFC 9420 §12.4.3.1
+        writer.WriteVectorV(inner =>
         {
-            writer.WriteUint8(1);
-            writer.WriteVectorV(inner =>
+            foreach (var psk in Psks)
             {
-                foreach (var psk in Psks)
-                {
-                    psk.WriteTo(inner);
-                }
-            });
-        }
-        else
-        {
-            writer.WriteUint8(0);
-        }
+                psk.WriteTo(inner);
+            }
+        });
     }
 
     public static GroupSecrets ReadFrom(TlsReader reader)
@@ -75,25 +67,18 @@ public sealed class GroupSecrets
             throw new TlsDecodingException($"Invalid optional presence flag for PathSecret: {hasPath}");
         }
 
-        byte hasPsks = reader.ReadUint8();
-        if (hasPsks == 1)
+        // psks<V> — vector (not optional) per RFC 9420 §12.4.3.1
+        byte[] pskData = reader.ReadOpaqueV();
+        var psks = new List<PreSharedKeyId>();
+        if (pskData.Length > 0)
         {
-            byte[] pskData = reader.ReadOpaqueV();
-            var psks = new List<PreSharedKeyId>();
-            if (pskData.Length > 0)
+            var pskReader = new TlsReader(pskData);
+            while (!pskReader.IsEmpty)
             {
-                var pskReader = new TlsReader(pskData);
-                while (!pskReader.IsEmpty)
-                {
-                    psks.Add(PreSharedKeyId.ReadFrom(pskReader));
-                }
+                psks.Add(PreSharedKeyId.ReadFrom(pskReader));
             }
-            gs.Psks = psks.ToArray();
         }
-        else if (hasPsks != 0)
-        {
-            throw new TlsDecodingException($"Invalid optional presence flag for Psks: {hasPsks}");
-        }
+        gs.Psks = psks.ToArray();
 
         return gs;
     }
