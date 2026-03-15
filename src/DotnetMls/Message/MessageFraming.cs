@@ -202,10 +202,11 @@ public static class MessageFraming
             return false;
 
         // 3. Verify membership tag for member senders
-        if (msg.Content.Sender.SenderType == SenderType.Member &&
-            membershipKey != null &&
-            msg.MembershipTag != null)
+        if (msg.Content.Sender.SenderType == SenderType.Member)
         {
+            if (membershipKey == null || msg.MembershipTag == null || msg.MembershipTag.Length == 0)
+                return false;
+
             byte[] tbm = BuildAuthenticatedContentTbm(tbs, msg.Auth, msg.Content.ContentType);
             if (!cs.VerifyMac(membershipKey, tbm, msg.MembershipTag))
                 return false;
