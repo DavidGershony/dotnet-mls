@@ -1812,6 +1812,8 @@ public class Rfc9420TestVectorTests
         public required ulong Epoch { get; set; }
         // Map from node index to HPKE private key (leaf + parent nodes)
         public Dictionary<uint, byte[]> PrivateKeys { get; set; } = new();
+        // Map from epoch number to resumption_psk for that epoch
+        public Dictionary<ulong, byte[]> ResumptionPsks { get; set; } = new();
     }
 
     /// <summary>
@@ -1914,7 +1916,7 @@ public class Rfc9420TestVectorTests
                 }
             }
             Assert.NotNull(treeData);
-            tree = Tree.RatchetTree.ReadFrom(new TlsReader(treeData));
+            tree = Tree.RatchetTree.ReadFrom(new TlsReader(treeData!));
         }
 
         // Find our leaf index
@@ -1994,6 +1996,11 @@ public class Rfc9420TestVectorTests
             }
         }
 
+        var resumptionPsks = new Dictionary<ulong, byte[]>
+        {
+            [groupContext.Epoch] = keySchedule.ResumptionPsk,
+        };
+
         return new PassiveClientState
         {
             Tree = tree,
@@ -2005,6 +2012,7 @@ public class Rfc9420TestVectorTests
             Extensions = groupContext.Extensions,
             Epoch = groupContext.Epoch,
             PrivateKeys = privateKeys,
+            ResumptionPsks = resumptionPsks,
         };
     }
 
@@ -2015,8 +2023,8 @@ public class Rfc9420TestVectorTests
         PassiveClientState state, PassiveClientEpoch epoch,
         PassiveClientVector v, ICipherSuite cs)
     {
-        // Parse standalone proposals and build proposal cache
-        var proposalCache = new Dictionary<string, Proposal>();
+        // Parse standalone proposals and build proposal cache (proposal + sender leaf index)
+        var proposalCache = new Dictionary<string, (Proposal Proposal, uint SenderLeaf)>();
         foreach (var propHex in epoch.Proposals)
         {
             var propMsg = MlsMessage.ReadFrom(new TlsReader(Hex(propHex)));
@@ -2031,7 +2039,8 @@ public class Rfc9420TestVectorTests
             });
             byte[] propRef = cs.RefHash("MLS 1.0 Proposal Reference", authContent);
             var proposal = Proposal.ReadFrom(new TlsReader(propPub.Content.Content));
-            proposalCache[Convert.ToHexString(propRef).ToLowerInvariant()] = proposal;
+            proposalCache[Convert.ToHexString(propRef).ToLowerInvariant()] =
+                (proposal, propPub.Content.Sender.LeafIndex);
         }
 
         // Parse commit PublicMessage
@@ -2058,12 +2067,22 @@ public class Rfc9420TestVectorTests
         var tentativeTree = state.Tree.Clone();
         var tentativeExtensions = (Extension[])state.Extensions.Clone();
 
-        // Resolve and apply proposals, collecting PSK references and tracking added leaves
+        // RFC 9420 §12.4: Proposals are applied in type order, not commit order.
+        // Order: GroupContextExtensions → Update → Remove (desc leaf index) → Add.
+        // PSK proposals are collected in commit order for key schedule but don't modify the tree.
         var pskIds = new List<PreSharedKeyId>();
         var addedLeaves = new List<uint>();
+
+        // First pass: resolve all proposals and collect by type
+        var updates = new List<(UpdateProposal Prop, uint SenderLeaf)>();
+        var removes = new List<RemoveProposal>();
+        var adds = new List<AddProposal>();
+        var gces = new List<GroupContextExtensionsProposal>();
+
         foreach (var por in commit.Proposals)
         {
             Proposal proposal;
+            uint proposerLeaf = senderLeaf; // default for inline proposals
             if (por is InlineProposal inline)
             {
                 proposal = inline.Proposal;
@@ -2073,30 +2092,70 @@ public class Rfc9420TestVectorTests
                 string refKey = Convert.ToHexString(pref.Reference).ToLowerInvariant();
                 Assert.True(proposalCache.ContainsKey(refKey),
                     $"Unknown proposal reference: {refKey}");
-                proposal = proposalCache[refKey];
+                var cached = proposalCache[refKey];
+                proposal = cached.Proposal;
+                proposerLeaf = cached.SenderLeaf;
             }
             else
             {
                 throw new InvalidOperationException("Unknown ProposalOrRef type");
             }
 
-            // Apply proposal to tentative tree
             if (proposal is AddProposal add)
-            {
-                uint newLeafIdx = tentativeTree.AddLeaf(add.KeyPackage.LeafNode);
-                addedLeaves.Add(newLeafIdx);
-            }
+                adds.Add(add);
             else if (proposal is RemoveProposal remove)
-                tentativeTree.BlankLeaf(remove.LeafIndex);
+                removes.Add(remove);
             else if (proposal is UpdateProposal update)
-            {
-                // Update proposal: sender updates their own leaf
-                tentativeTree.SetLeaf(senderLeaf, update.LeafNode);
-            }
+                updates.Add((update, proposerLeaf));
             else if (proposal is PreSharedKeyProposal pskProp)
                 pskIds.Add(pskProp.Psk);
             else if (proposal is GroupContextExtensionsProposal gce)
-                tentativeExtensions = gce.Extensions;
+                gces.Add(gce);
+        }
+
+        // Apply in type order: GCE → Update → Remove → Add
+        foreach (var gce in gces)
+        {
+            tentativeExtensions = gce.Extensions;
+
+        }
+
+        foreach (var (update, propLeaf) in updates)
+        {
+            tentativeTree.SetLeaf(propLeaf, update.LeafNode);
+            var updateDp = TreeMath.DirectPath(propLeaf, tentativeTree.LeafCount);
+            foreach (uint dpNode in updateDp)
+                tentativeTree.SetParent(dpNode, null);
+
+        }
+
+        foreach (var remove in removes.OrderByDescending(r => r.LeafIndex))
+        {
+            for (int ni = 1; ni < tentativeTree.NodeCount; ni += 2)
+            {
+                var pn = tentativeTree.GetParent((uint)ni);
+                if (pn != null)
+                    pn.UnmergedLeaves.Remove(remove.LeafIndex);
+            }
+            uint removeNodeIdx = TreeMath.LeafToNode(remove.LeafIndex);
+            tentativeTree.SetNode(removeNodeIdx, new TreeNode.Leaf(null));
+            var removeDp = TreeMath.DirectPath(remove.LeafIndex, tentativeTree.LeafCount);
+            foreach (uint dpNode in removeDp)
+                tentativeTree.SetParent(dpNode, null);
+
+        }
+
+        // RFC 9420 §7.7.1: Truncate the tree after all removes
+        // Remove trailing blank leaf+parent pairs so tree size matches sender's view
+        if (removes.Count > 0)
+        {
+            tentativeTree.TrimTree();
+        }
+
+        foreach (var add in adds)
+        {
+            uint newLeafIdx = tentativeTree.AddLeaf(add.KeyPackage.LeafNode);
+            addedLeaves.Add(newLeafIdx);
         }
 
         // Process UpdatePath if present
@@ -2114,17 +2173,24 @@ public class Rfc9420TestVectorTests
             foreach (uint n in senderDp)
                 tentativeTree.SetParent(n, null);
 
-            // Filtered direct path
+            // RFC 9420 §7.6: Filtered direct path excludes entries whose copath
+            // child has empty resolution. The resolution for this check excludes
+            // newly added members (they won't be encrypted to in this commit).
+            var addedNodeIndices = new HashSet<uint>(addedLeaves.Select(l => TreeMath.LeafToNode(l)));
             var filteredDp = new List<uint>();
             var filteredCopath = new List<uint>();
             for (int i = 0; i < senderDp.Length; i++)
             {
-                if (tentativeTree.Resolution(senderCopath[i]).Count > 0)
+                var res = tentativeTree.Resolution(senderCopath[i]);
+                var encRes = res.Where(n => !addedNodeIndices.Contains(n)).ToList();
+                if (encRes.Count > 0)
                 {
                     filteredDp.Add(senderDp[i]);
                     filteredCopath.Add(senderCopath[i]);
                 }
             }
+
+            Assert.Equal(commit.Path.Nodes.Length, filteredDp.Count);
 
             for (int i = 0; i < filteredDp.Count; i++)
             {
@@ -2148,37 +2214,20 @@ public class Rfc9420TestVectorTests
                 tentativeTree.GetParent(nodeIdx)!.ParentHash = parentHash;
             }
 
-            // RFC 9420 §7.7: Update unmerged leaves
-            // Step 1: Already done - all parent nodes on committer's DP have empty unmerged-leaves
-            //         (we created them with empty lists above).
-            // Step 2: For each added leaf, add to unmerged-leaves of applicable parent nodes.
+            // RFC 9420 §12.4.2 step 5: For each added member, add to unmerged_leaves
+            // of each non-blank ancestor that is NOT on the sender's filtered direct path.
+            var filteredDpSet = new HashSet<uint>(filteredDp);
             foreach (uint addedLeaf in addedLeaves)
             {
                 var addedDp = TreeMath.DirectPath(addedLeaf, tentativeTree.LeafCount);
-                var addedDpSet = new HashSet<uint>(addedDp);
-
-                // Step 2a: If commit has a path, add to committer's filtered DP nodes
-                // that are NOT in the added leaf's direct path
-                foreach (uint fdpNode in filteredDp)
+                foreach (uint dpNode in addedDp)
                 {
-                    if (!addedDpSet.Contains(fdpNode))
+                    if (!filteredDpSet.Contains(dpNode))
                     {
-                        var pn = tentativeTree.GetParent(fdpNode);
+                        var pn = tentativeTree.GetParent(dpNode);
                         if (pn != null)
                             pn.UnmergedLeaves.Add(addedLeaf);
                     }
-                }
-
-                // Step 2b: Add to non-blank parent nodes between the added leaf and
-                // the common ancestor of the added leaf and the committer
-                uint commonAnc = TreeMath.CommonAncestor(addedLeaf, senderLeaf);
-                foreach (uint dpNode in addedDp)
-                {
-                    if (dpNode == commonAnc)
-                        break;
-                    var pn = tentativeTree.GetParent(dpNode);
-                    if (pn != null)
-                        pn.UnmergedLeaves.Add(addedLeaf);
                 }
             }
 
@@ -2211,27 +2260,23 @@ public class Rfc9420TestVectorTests
             };
             byte[] newCtxBytes = TlsCodec.Serialize(w => newGroupContext.WriteTo(w));
 
-            // HPKE context for EncryptWithLabel
-            byte[] encryptContext = TlsCodec.Serialize(w =>
-            {
-                w.WriteOpaqueV(System.Text.Encoding.UTF8.GetBytes("MLS 1.0 UpdatePathNode"));
-                w.WriteOpaqueV(newCtxBytes);
-            });
-
             // Find our decryption position in filtered copath
+            // (addedNodeIndices already computed above for filtered DP)
             int copathPos = -1;
             int resPos = -1;
+            uint resNodeIdx = uint.MaxValue;
             for (int i = 0; i < filteredCopath.Count; i++)
             {
-                // Use tentativeTree for resolution (after proposals, before UpdatePath was
-                // the original tree, but copath subtrees aren't affected by UpdatePath)
                 var resolution = originalTree.Resolution(filteredCopath[i]);
-                for (int j = 0; j < resolution.Count; j++)
+                // Filter out added leaves to get the encryption resolution
+                var encResolution = resolution.Where(n => !addedNodeIndices.Contains(n)).ToList();
+                for (int j = 0; j < encResolution.Count; j++)
                 {
-                    if (state.PrivateKeys.ContainsKey(resolution[j]))
+                    if (state.PrivateKeys.ContainsKey(encResolution[j]))
                     {
                         copathPos = i;
                         resPos = j;
+                        resNodeIdx = encResolution[j];
                         break;
                     }
                 }
@@ -2241,16 +2286,31 @@ public class Rfc9420TestVectorTests
             Assert.True(copathPos >= 0,
                 $"Passive client (leaf {state.MyLeafIndex}) not found in any filtered copath resolution for sender {senderLeaf}");
 
-            // Decrypt path secret
+            // Decrypt path secret using provisional GroupContext
             var ct = commit.Path.Nodes[copathPos].EncryptedPathSecret[resPos];
-            uint resNodeIdx = originalTree.Resolution(filteredCopath[copathPos])[resPos];
+            byte[] myPrivKey = state.PrivateKeys[resNodeIdx];
 
-            byte[] pathSecret = cs.HpkeOpen(
-                state.PrivateKeys[resNodeIdx],
-                ct.KemOutput,
-                encryptContext,
-                Array.Empty<byte>(),
-                ct.Ciphertext);
+            // RFC 9420 §12.4.2: The provisional GroupContext for EncryptWithLabel uses
+            // the new epoch and new tree_hash, but the OLD confirmed_transcript_hash.
+            var provisionalGroupContext = new GroupContext
+            {
+                Version = ProtocolVersion.Mls10,
+                CipherSuite = cs.Id,
+                GroupId = state.GroupContext.GroupId,
+                Epoch = state.Epoch + 1,
+                TreeHash = provisionalTreeHash,
+                ConfirmedTranscriptHash = state.GroupContext.ConfirmedTranscriptHash,
+                Extensions = tentativeExtensions,
+            };
+            byte[] provisionalCtxBytes = TlsCodec.Serialize(w => provisionalGroupContext.WriteTo(w));
+            byte[] provisionalEncryptContext = TlsCodec.Serialize(w =>
+            {
+                w.WriteOpaqueV(System.Text.Encoding.UTF8.GetBytes("MLS 1.0 UpdatePathNode"));
+                w.WriteOpaqueV(provisionalCtxBytes);
+            });
+
+            byte[] pathSecret = cs.HpkeOpen(myPrivKey, ct.KemOutput, provisionalEncryptContext,
+                Array.Empty<byte>(), ct.Ciphertext);
 
             // Derive forward: compute private keys for all filtered DP nodes from copathPos onward
             byte[] currentPathSecret = pathSecret;
@@ -2261,6 +2321,7 @@ public class Rfc9420TestVectorTests
                 byte[] nodePriv = DeriveHpkePrivateKey(cs, nodeSecret);
                 newPrivateKeys[filteredDp[i]] = nodePriv;
                 tentativeTree.GetParent(filteredDp[i])!.PrivateKey = nodePriv;
+
                 if (i < filteredDp.Count - 1)
                     currentPathSecret = cs.DeriveSecret(currentPathSecret, "path");
             }
@@ -2270,27 +2331,7 @@ public class Rfc9420TestVectorTests
             state.PrivateKeys = newPrivateKeys;
 
             // Compute PSK secret for key schedule
-            byte[]? pskSecretParam = null;
-            if (pskIds.Count > 0)
-            {
-                var pskInputs = pskIds.Select(id =>
-                {
-                    byte[] pskValue = Array.Empty<byte>();
-                    if (id.PskType == PskType.External)
-                    {
-                        foreach (var extPsk in v.ExternalPsks)
-                        {
-                            if (Hex(extPsk.PskId).AsSpan().SequenceEqual(id.PskId))
-                            {
-                                pskValue = Hex(extPsk.Psk);
-                                break;
-                            }
-                        }
-                    }
-                    return new PskSecretDerivation.PskInput { Id = id, PskValue = pskValue };
-                }).ToArray();
-                pskSecretParam = PskSecretDerivation.ComputePskSecret(cs, pskInputs);
-            }
+            byte[]? pskSecretParam = ComputePskSecretFromProposals(pskIds, v, cs, state);
 
             // Derive new key schedule
             var newKeySchedule = KeyScheduleEpoch.Create(
@@ -2315,11 +2356,27 @@ public class Rfc9420TestVectorTests
             state.InterimTranscriptHash = newInterimHash;
             state.Extensions = tentativeExtensions;
             state.Epoch = state.Epoch + 1;
+            state.ResumptionPsks[state.Epoch] = newKeySchedule.ResumptionPsk;
         }
         else
         {
             // No UpdatePath: commit_secret = zeros
             commitSecret = new byte[cs.SecretSize];
+
+            // RFC 9420 §7.7: When there's no UpdatePath, add each newly added leaf
+            // to unmerged_leaves of ALL non-blank parent nodes on its direct path.
+            // The new member doesn't know any parent keys, so all parent nodes
+            // above it need to track it as unmerged.
+            foreach (uint addedLeaf in addedLeaves)
+            {
+                var addedDp = TreeMath.DirectPath(addedLeaf, tentativeTree.LeafCount);
+                foreach (uint dpNode in addedDp)
+                {
+                    var pn = tentativeTree.GetParent(dpNode);
+                    if (pn != null)
+                        pn.UnmergedLeaves.Add(addedLeaf);
+                }
+            }
 
             // Compute tree hash
             uint root = TreeMath.Root(tentativeTree.LeafCount);
@@ -2348,27 +2405,7 @@ public class Rfc9420TestVectorTests
             byte[] newCtxBytes = TlsCodec.Serialize(w => newGroupContext.WriteTo(w));
 
             // PSK secret
-            byte[]? pskSecretParam = null;
-            if (pskIds.Count > 0)
-            {
-                var pskInputs = pskIds.Select(id =>
-                {
-                    byte[] pskValue = Array.Empty<byte>();
-                    if (id.PskType == PskType.External)
-                    {
-                        foreach (var extPsk in v.ExternalPsks)
-                        {
-                            if (Hex(extPsk.PskId).AsSpan().SequenceEqual(id.PskId))
-                            {
-                                pskValue = Hex(extPsk.Psk);
-                                break;
-                            }
-                        }
-                    }
-                    return new PskSecretDerivation.PskInput { Id = id, PskValue = pskValue };
-                }).ToArray();
-                pskSecretParam = PskSecretDerivation.ComputePskSecret(cs, pskInputs);
-            }
+            byte[]? pskSecretParam = ComputePskSecretFromProposals(pskIds, v, cs, state);
 
             var newKeySchedule = KeyScheduleEpoch.Create(
                 cs, state.KeySchedule.InitSecret, commitSecret, newCtxBytes, pskSecretParam);
@@ -2389,7 +2426,33 @@ public class Rfc9420TestVectorTests
             state.InterimTranscriptHash = newInterimHash;
             state.Extensions = tentativeExtensions;
             state.Epoch = state.Epoch + 1;
+            state.ResumptionPsks[state.Epoch] = newKeySchedule.ResumptionPsk;
         }
+
+        // Clean up stale private keys for nodes that are now blank or out of bounds
+        var staleKeys = new List<uint>();
+        foreach (var (nodeIdx, _) in state.PrivateKeys)
+        {
+            if (nodeIdx == TreeMath.LeafToNode(state.MyLeafIndex))
+                continue; // Always keep our own leaf key
+            if (nodeIdx >= (uint)state.Tree.NodeCount)
+            {
+                staleKeys.Add(nodeIdx);
+                continue;
+            }
+            if (TreeMath.IsLeaf(nodeIdx))
+            {
+                var leaf = state.Tree.GetLeaf(nodeIdx / 2);
+                if (leaf == null) staleKeys.Add(nodeIdx);
+            }
+            else
+            {
+                var par = state.Tree.GetParent(nodeIdx);
+                if (par == null) staleKeys.Add(nodeIdx);
+            }
+        }
+        foreach (var key in staleKeys)
+            state.PrivateKeys.Remove(key);
     }
 
     // ---- Passive Client: Welcome Test Vectors ----
@@ -2472,6 +2535,43 @@ public class Rfc9420TestVectorTests
             ProcessEpochForPassiveClient(state, v.Epochs[i], v, cs);
             Assert.Equal(Hex(v.Epochs[i].EpochAuthenticator), state.KeySchedule.EpochAuthenticator);
         }
+    }
+
+    private byte[]? ComputePskSecretFromProposals(
+        List<PreSharedKeyId> pskIds, PassiveClientVector v, ICipherSuite cs,
+        PassiveClientState state)
+    {
+        if (pskIds.Count == 0) return null;
+
+        var pskInputs = pskIds.Select((id, idx) =>
+        {
+            byte[] pskValue = Array.Empty<byte>();
+            if (id.PskType == PskType.External)
+            {
+                foreach (var extPsk in v.ExternalPsks)
+                {
+                    if (Hex(extPsk.PskId).AsSpan().SequenceEqual(id.PskId))
+                    {
+                        pskValue = Hex(extPsk.Psk);
+                        break;
+                    }
+                }
+                Assert.True(pskValue.Length > 0,
+                    $"PSK[{idx}] External PskId={Convert.ToHexString(id.PskId).ToLowerInvariant()} " +
+                    $"not found in {v.ExternalPsks.Length} external PSKs. " +
+                    $"Available: [{string.Join(",", v.ExternalPsks.Select(p => p.PskId))}]");
+            }
+            else if (id.PskType == PskType.Resumption)
+            {
+                Assert.True(state.ResumptionPsks.ContainsKey(id.ResumptionEpoch),
+                    $"PSK[{idx}] Resumption PSK for epoch {id.ResumptionEpoch} not found. " +
+                    $"Available epochs: [{string.Join(",", state.ResumptionPsks.Keys)}]");
+                pskValue = state.ResumptionPsks[id.ResumptionEpoch];
+            }
+            return new PskSecretDerivation.PskInput { Id = id, PskValue = pskValue };
+        }).ToArray();
+
+        return PskSecretDerivation.ComputePskSecret(cs, pskInputs);
     }
 
 }

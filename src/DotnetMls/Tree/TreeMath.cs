@@ -84,6 +84,26 @@ public static class TreeMath
     }
 
     /// <summary>
+    /// Returns the right child of a parent node, clamped to the tree bounds.
+    /// Per RFC 9420 Appendix C: if the computed right child is beyond the tree,
+    /// walk left until a valid node is found.
+    /// This is used for tree operations (Sibling, Copath) but NOT for tree hash
+    /// computation (which uses phantom blank subtrees via unclamped Right).
+    /// </summary>
+    /// <param name="x">The parent node index.</param>
+    /// <param name="nodeCount">The total number of nodes in the tree.</param>
+    /// <returns>The clamped right child node index.</returns>
+    public static uint RightClamped(uint x, uint nodeCount)
+    {
+        uint r = Right(x);
+        while (r >= nodeCount)
+        {
+            r = Left(r);
+        }
+        return r;
+    }
+
+    /// <summary>
     /// Returns the parent of a node within a tree of the given total node count.
     /// Handles the left-balanced tree structure where the computed parent may
     /// exceed the node count, requiring iteration upward.
@@ -141,17 +161,11 @@ public static class TreeMath
     public static uint Sibling(uint x, uint nodeCount)
     {
         uint p = Parent(x, nodeCount);
-        uint l = Left(p);
-        uint r = Right(p);
 
-        // If x is in the left subtree of the parent, the sibling is the
-        // right subtree root, and vice versa. However, x might not be the
-        // immediate child but rather a descendant (when the tree is truncated).
-        // In that case, we check which side x falls on.
         if (x < p)
-            return r;
+            return Right(p);
         else
-            return l;
+            return Left(p);
     }
 
     /// <summary>

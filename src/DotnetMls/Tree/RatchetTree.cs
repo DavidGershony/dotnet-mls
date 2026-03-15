@@ -205,6 +205,12 @@ public sealed class RatchetTree
 
     private void ResolveInto(uint nodeIndex, List<uint> result)
     {
+        uint nodeCount = (uint)_nodes.Count;
+
+        // Out-of-bounds leaf nodes have empty resolution
+        if (nodeIndex >= nodeCount && TreeMath.IsLeaf(nodeIndex))
+            return;
+
         var node = GetNode(nodeIndex);
 
         if (TreeMath.IsLeaf(nodeIndex))
@@ -230,20 +236,18 @@ public sealed class RatchetTree
             return;
         }
 
-        // Blank parent: recurse into children
-        uint nodeCount = (uint)_nodes.Count;
+        // Blank or out-of-bounds parent: recurse into children.
+        // In a left-balanced tree, phantom parent nodes (beyond nodeCount) may have
+        // real descendants. E.g., for 40 leaves (79 nodes), phantom node 95's
+        // subtree reaches real node 71 via Left(95)=79 → Left(79)=71.
+        // Recursion terminates at out-of-bounds leaves (first check above).
         if (nodeCount == 0)
             return;
 
         uint left = TreeMath.Left(nodeIndex);
         uint right = TreeMath.Right(nodeIndex);
-
-        // Right child might be beyond tree bounds in a truncated tree
         ResolveInto(left, result);
-        if (right < nodeCount)
-        {
-            ResolveInto(right, result);
-        }
+        ResolveInto(right, result);
     }
 
     // ---- Tree hash (RFC 9420 Section 7.8) ----
@@ -561,7 +565,7 @@ public sealed class RatchetTree
     /// Trims trailing blank nodes from the tree. The tree should always end with
     /// a leaf (even index), so we remove trailing blank leaf + blank parent pairs.
     /// </summary>
-    private void TrimTree()
+    public void TrimTree()
     {
         while (_nodes.Count >= 2)
         {
