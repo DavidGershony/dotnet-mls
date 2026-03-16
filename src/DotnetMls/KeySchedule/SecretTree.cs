@@ -121,8 +121,10 @@ public sealed class SecretTree
         _handshakeRatchets = new RatchetState?[leafCount];
         _applicationRatchets = new RatchetState?[leafCount];
 
-        // Place the encryption_secret at the root.
-        _nodeSecrets[RootIndex()] = encryptionSecret;
+        // Place a copy of the encryption_secret at the root.
+        // Must clone because EraseSecret will Array.Clear this when deriving children,
+        // which would corrupt the caller's original array.
+        _nodeSecrets[RootIndex()] = (byte[])encryptionSecret.Clone();
     }
 
     /// <summary>
