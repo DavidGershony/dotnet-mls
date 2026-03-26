@@ -1384,30 +1384,75 @@ public class Rfc9420TestVectorTests
     }
 
     /// <summary>
-    /// RFC 9420 Section 13.7: Tree Validation.
-    /// Verifies ALL four required checks:
-    ///   1. Resolutions match expected values
-    ///   2. Tree hashes match expected values
-    ///   3. Parent hash values are consistent
-    ///   4. Leaf node signatures verify with group_id context
+    /// Original combined tree-validation test. Kept for backward compatibility
+    /// while the individual Theory tests above provide better isolation.
+    /// TODO: Remove once Theory tests are confirmed stable.
     /// </summary>
     [Fact]
-    public void TreeValidation_MatchesOfficialVectors()
+    public void TreeValidation_TreeHash_MatchesOfficialVectors()
     {
         var vectors = JsonSerializer.Deserialize<TreeValidationVector[]>(
             File.ReadAllText(VectorPath("tree-validation.json")), JsonOpts)!;
 
         var v = vectors.First(x => x.CipherSuite == 1);
         var cs = new CipherSuite0x0001();
-        var groupId = Hex(v.GroupId);
 
         var tree = Tree.RatchetTree.ReadFrom(new TlsReader(Hex(v.TreeData)));
 
-        // Check 1: Verify tree round-trip serialization
         byte[] reserialized = TlsCodec.Serialize(w => tree.WriteTo(w));
         Assert.Equal(Hex(v.TreeData), reserialized);
 
-        // Check 2: Verify tree hash for each node
+        for (int i = 0; i < v.TreeHashes.Length; i++)
+        {
+            byte[] expected = Hex(v.TreeHashes[i]);
+            byte[] actual = tree.ComputeTreeHash(cs, (uint)i);
+            Assert.True(expected.SequenceEqual(actual),
+                $"Tree hash mismatch at node {i}");
+        }
+
+        for (int i = 0; i < v.Resolutions.Length; i++)
+        {
+            var expected = v.Resolutions[i];
+            var actual = tree.Resolution((uint)i);
+            Assert.Equal(expected, actual.ToArray());
+        }
+    }
+
+    public static IEnumerable<object[]> TreeValidationVectors()
+    {
+        var vectors = JsonSerializer.Deserialize<TreeValidationVector[]>(
+            File.ReadAllText(VectorPath("tree-validation.json")), JsonOpts)!;
+        foreach (var v in vectors.Where(x => x.CipherSuite == 1))
+            yield return new object[] { v };
+    }
+
+    private static (Tree.RatchetTree tree, ICipherSuite cs) ParseTreeVector(TreeValidationVector v)
+    {
+        var cs = new CipherSuite0x0001();
+        var tree = Tree.RatchetTree.ReadFrom(new TlsReader(Hex(v.TreeData)));
+        return (tree, cs);
+    }
+
+    /// <summary>
+    /// RFC 9420 §13.6 Check 1: Tree serialization round-trips exactly.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(TreeValidationVectors))]
+    public void TreeValidation_Serialization_RoundTrips(TreeValidationVector v)
+    {
+        var (tree, _) = ParseTreeVector(v);
+        byte[] reserialized = TlsCodec.Serialize(w => tree.WriteTo(w));
+        Assert.Equal(Hex(v.TreeData), reserialized);
+    }
+
+    /// <summary>
+    /// RFC 9420 §13.6 Check 2: Tree hash at each node matches the expected value.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(TreeValidationVectors))]
+    public void TreeValidation_TreeHashes_MatchExpected(TreeValidationVector v)
+    {
+        var (tree, cs) = ParseTreeVector(v);
         for (int i = 0; i < v.TreeHashes.Length; i++)
         {
             byte[] expected = Hex(v.TreeHashes[i]);
@@ -1416,69 +1461,92 @@ public class Rfc9420TestVectorTests
                 $"Tree hash mismatch at node {i}: " +
                 $"expected {v.TreeHashes[i][..16]}..., got {Convert.ToHexString(actual)[..16]}...");
         }
+    }
 
-        // Check 3: Verify resolutions for each node
+    /// <summary>
+    /// RFC 9420 §13.6 Check 3: Resolution of each node matches the expected value.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(TreeValidationVectors))]
+    public void TreeValidation_Resolutions_MatchExpected(TreeValidationVector v)
+    {
+        var (tree, _) = ParseTreeVector(v);
         for (int i = 0; i < v.Resolutions.Length; i++)
         {
             var expected = v.Resolutions[i];
             var actual = tree.Resolution((uint)i);
             Assert.Equal(expected, actual.ToArray());
         }
+    }
 
-        // Check 4: Verify leaf node signatures using group_id as context
-        // RFC 9420 §7.2: LeafNodeTBS includes group_id + leaf_index for update/commit sources
+    /// <summary>
+    /// RFC 9420 §13.6 Check 4: Leaf node signatures verify using group_id as context.
+    /// LeafNodeTBS for Update/Commit sources includes group_id + leaf_index (RFC 9420 §7.2).
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(TreeValidationVectors))]
+    public void TreeValidation_LeafSignatures_Verify(TreeValidationVector v)
+    {
+        var (tree, cs) = ParseTreeVector(v);
+        var groupId = Hex(v.GroupId);
+
         int leafCount = (int)tree.LeafCount;
         int verifiedCount = 0;
         for (uint leafIdx = 0; leafIdx < leafCount; leafIdx++)
         {
             var leaf = tree.GetLeaf(leafIdx);
-            if (leaf == null) continue; // blank leaf
+            if (leaf == null) continue;
 
-            // Build LeafNodeTBS per RFC 9420 §7.2
-            byte[] tbs = TlsCodec.Serialize(writer =>
-            {
-                writer.WriteOpaqueV(leaf.EncryptionKey);
-                writer.WriteOpaqueV(leaf.SignatureKey);
-                leaf.Credential.WriteTo(writer);
-                leaf.Capabilities.WriteTo(writer);
-                writer.WriteUint8((byte)leaf.Source);
-
-                switch (leaf.Source)
-                {
-                    case LeafNodeSource.KeyPackage:
-                        if (leaf.Lifetime != null)
-                            leaf.Lifetime.WriteTo(writer);
-                        break;
-                    case LeafNodeSource.Commit:
-                        writer.WriteOpaqueV(leaf.ParentHash);
-                        break;
-                    // Update: no source-specific fields in the body
-                }
-
-                writer.WriteVectorV(inner =>
-                {
-                    foreach (var ext in leaf.Extensions)
-                        ext.WriteTo(inner);
-                });
-
-                // Context fields for TBS (not in wire format):
-                if (leaf.Source == LeafNodeSource.Update ||
-                    leaf.Source == LeafNodeSource.Commit)
-                {
-                    writer.WriteOpaqueV(groupId);
-                    writer.WriteUint32(leafIdx);
-                }
-            });
-
+            byte[] tbs = BuildLeafNodeTbs(leaf, groupId, leafIdx);
             bool valid = cs.VerifyWithLabel(leaf.SignatureKey, "LeafNodeTBS", tbs, leaf.Signature);
             Assert.True(valid,
-                $"Leaf node signature verification failed at leaf {leafIdx} " +
+                $"Leaf signature failed at leaf {leafIdx} " +
                 $"(source={leaf.Source}, sigKey={Convert.ToHexString(leaf.SignatureKey)[..16]}...)");
 
             verifiedCount++;
         }
 
         Assert.True(verifiedCount > 0, "No leaf nodes found to verify");
+    }
+
+    /// <summary>
+    /// Builds the LeafNodeTBS per RFC 9420 §7.2. Shared by tree-validation and
+    /// leaf-signature tests.
+    /// </summary>
+    private static byte[] BuildLeafNodeTbs(LeafNode leaf, byte[] groupId, uint leafIndex)
+    {
+        return TlsCodec.Serialize(writer =>
+        {
+            writer.WriteOpaqueV(leaf.EncryptionKey);
+            writer.WriteOpaqueV(leaf.SignatureKey);
+            leaf.Credential.WriteTo(writer);
+            leaf.Capabilities.WriteTo(writer);
+            writer.WriteUint8((byte)leaf.Source);
+
+            switch (leaf.Source)
+            {
+                case LeafNodeSource.KeyPackage:
+                    if (leaf.Lifetime != null)
+                        leaf.Lifetime.WriteTo(writer);
+                    break;
+                case LeafNodeSource.Commit:
+                    writer.WriteOpaqueV(leaf.ParentHash);
+                    break;
+            }
+
+            writer.WriteVectorV(inner =>
+            {
+                foreach (var ext in leaf.Extensions)
+                    ext.WriteTo(inner);
+            });
+
+            if (leaf.Source == LeafNodeSource.Update ||
+                leaf.Source == LeafNodeSource.Commit)
+            {
+                writer.WriteOpaqueV(groupId);
+                writer.WriteUint32(leafIndex);
+            }
+        });
     }
 
     // ================================================================
