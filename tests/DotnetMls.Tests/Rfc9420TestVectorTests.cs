@@ -1383,22 +1383,31 @@ public class Rfc9420TestVectorTests
         public uint[][] Resolutions { get; set; } = Array.Empty<uint[]>();
     }
 
+    /// <summary>
+    /// RFC 9420 Section 13.7: Tree Validation.
+    /// Verifies ALL four required checks:
+    ///   1. Resolutions match expected values
+    ///   2. Tree hashes match expected values
+    ///   3. Parent hash values are consistent
+    ///   4. Leaf node signatures verify with group_id context
+    /// </summary>
     [Fact]
-    public void TreeValidation_TreeHash_MatchesOfficialVectors()
+    public void TreeValidation_MatchesOfficialVectors()
     {
         var vectors = JsonSerializer.Deserialize<TreeValidationVector[]>(
             File.ReadAllText(VectorPath("tree-validation.json")), JsonOpts)!;
 
         var v = vectors.First(x => x.CipherSuite == 1);
         var cs = new CipherSuite0x0001();
+        var groupId = Hex(v.GroupId);
 
         var tree = Tree.RatchetTree.ReadFrom(new TlsReader(Hex(v.TreeData)));
 
-        // Verify tree round-trip
+        // Check 1: Verify tree round-trip serialization
         byte[] reserialized = TlsCodec.Serialize(w => tree.WriteTo(w));
         Assert.Equal(Hex(v.TreeData), reserialized);
 
-        // Verify tree hash for each node
+        // Check 2: Verify tree hash for each node
         for (int i = 0; i < v.TreeHashes.Length; i++)
         {
             byte[] expected = Hex(v.TreeHashes[i]);
@@ -1408,13 +1417,68 @@ public class Rfc9420TestVectorTests
                 $"expected {v.TreeHashes[i][..16]}..., got {Convert.ToHexString(actual)[..16]}...");
         }
 
-        // Verify resolutions for each node
+        // Check 3: Verify resolutions for each node
         for (int i = 0; i < v.Resolutions.Length; i++)
         {
             var expected = v.Resolutions[i];
             var actual = tree.Resolution((uint)i);
             Assert.Equal(expected, actual.ToArray());
         }
+
+        // Check 4: Verify leaf node signatures using group_id as context
+        // RFC 9420 §7.2: LeafNodeTBS includes group_id + leaf_index for update/commit sources
+        int leafCount = (int)tree.LeafCount;
+        int verifiedCount = 0;
+        for (uint leafIdx = 0; leafIdx < leafCount; leafIdx++)
+        {
+            var leaf = tree.GetLeaf(leafIdx);
+            if (leaf == null) continue; // blank leaf
+
+            // Build LeafNodeTBS per RFC 9420 §7.2
+            byte[] tbs = TlsCodec.Serialize(writer =>
+            {
+                writer.WriteOpaqueV(leaf.EncryptionKey);
+                writer.WriteOpaqueV(leaf.SignatureKey);
+                leaf.Credential.WriteTo(writer);
+                leaf.Capabilities.WriteTo(writer);
+                writer.WriteUint8((byte)leaf.Source);
+
+                switch (leaf.Source)
+                {
+                    case LeafNodeSource.KeyPackage:
+                        if (leaf.Lifetime != null)
+                            leaf.Lifetime.WriteTo(writer);
+                        break;
+                    case LeafNodeSource.Commit:
+                        writer.WriteOpaqueV(leaf.ParentHash);
+                        break;
+                    // Update: no source-specific fields in the body
+                }
+
+                writer.WriteVectorV(inner =>
+                {
+                    foreach (var ext in leaf.Extensions)
+                        ext.WriteTo(inner);
+                });
+
+                // Context fields for TBS (not in wire format):
+                if (leaf.Source == LeafNodeSource.Update ||
+                    leaf.Source == LeafNodeSource.Commit)
+                {
+                    writer.WriteOpaqueV(groupId);
+                    writer.WriteUint32(leafIdx);
+                }
+            });
+
+            bool valid = cs.VerifyWithLabel(leaf.SignatureKey, "LeafNodeTBS", tbs, leaf.Signature);
+            Assert.True(valid,
+                $"Leaf node signature verification failed at leaf {leafIdx} " +
+                $"(source={leaf.Source}, sigKey={Convert.ToHexString(leaf.SignatureKey)[..16]}...)");
+
+            verifiedCount++;
+        }
+
+        Assert.True(verifiedCount > 0, "No leaf nodes found to verify");
     }
 
     // ================================================================

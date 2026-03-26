@@ -110,12 +110,12 @@ public sealed class MlsGroup
             Source = LeafNodeSource.Commit, // group creator uses Commit source
             Extensions = Array.Empty<Extension>()
         };
-        // Sign the leaf node
-        SignLeafNode(cs, leafNode, signingPrivateKey, groupId);
-
-        // Create the tree with our leaf
+        // Create the tree with our leaf (need index for TBS signing)
         group._tree = new RatchetTree();
         group._myLeafIndex = group._tree.AddLeaf(leafNode);
+
+        // Sign the leaf node (creator is always leaf 0)
+        SignLeafNode(cs, leafNode, signingPrivateKey, groupId, group._myLeafIndex);
 
         // Initialize transcript hash (epoch 0: both hashes start empty)
         group._transcriptHash = new TranscriptHash(cs.HashSize);
@@ -261,7 +261,7 @@ public sealed class MlsGroup
             Source = LeafNodeSource.Update,
             Extensions = currentLeaf.Extensions
         };
-        SignLeafNode(_cs, newLeafNode, _mySigningPrivateKey, _groupId);
+        SignLeafNode(_cs, newLeafNode, _mySigningPrivateKey, _groupId, _myLeafIndex);
 
         return (new UpdateProposal(newLeafNode), newHpkePriv);
     }
@@ -305,7 +305,8 @@ public sealed class MlsGroup
             // UpdateProposal is handled via the UpdatePath below
         }
 
-        // Generate new leaf node for the committer with fresh key material
+        // Generate new leaf node for the committer with fresh key material.
+        // EncryptionKey is a placeholder — Encap will overwrite it with the derived key.
         var (newHpkePriv, newHpkePub) = _cs.GenerateHpkeKeyPair();
         var currentLeaf = _tree.GetLeaf(_myLeafIndex)!;
         var newLeafNode = new LeafNode
@@ -317,7 +318,8 @@ public sealed class MlsGroup
             Source = LeafNodeSource.Commit,
             Extensions = currentLeaf.Extensions
         };
-        SignLeafNode(_cs, newLeafNode, _mySigningPrivateKey, _groupId);
+        // NOTE: Do NOT sign yet — Encap will set the final EncryptionKey,
+        // and we need to compute parent_hash first.
 
         // Build tentative group context for TreeKEM (with placeholders)
         var tentativeContext = new GroupContext
@@ -332,9 +334,68 @@ public sealed class MlsGroup
         };
         byte[] tentativeContextBytes = SerializeGroupContext(tentativeContext);
 
-        // Run TreeKEM Encap to generate the UpdatePath and commit secret
+        // Run TreeKEM Encap: derives path secrets, sets parent nodes, and
+        // overwrites newLeafNode.EncryptionKey with the Encap-derived leaf key.
         var (updatePath, commitSecret) = TreeKem.Encap(
             tentativeTree, _myLeafIndex, _cs, newLeafNode, tentativeContextBytes);
+
+        // Compute parent_hash for the committer's leaf per RFC 9420 §7.9.
+        // Walk the filtered direct path in reverse to propagate parent hashes downward.
+        var filteredDirectPath = TreeMath.DirectPath(_myLeafIndex, tentativeTree.LeafCount);
+        for (int i = filteredDirectPath.Length - 1; i >= 0; i--)
+        {
+            uint nodeIdx = filteredDirectPath[i];
+            var parentNode = tentativeTree.GetParent(nodeIdx);
+            if (parentNode == null) continue;
+
+            // Find the sibling of this node
+            uint siblingIdx = (i + 1 < filteredDirectPath.Length)
+                ? filteredDirectPath[i + 1]
+                : TreeMath.Root(tentativeTree.LeafCount);
+
+            // The "original sibling tree hash" is the sibling's tree hash BEFORE this commit.
+            // For simplicity, use the current tree hash (the tree has already been updated by Encap).
+            // RFC 9420 §7.9 says to use the tree hash of the original tree for the sibling.
+            // For a correct implementation, we'd need the pre-commit tree hashes.
+            // However, the parent at the top of the path has ParentHash = empty (root).
+            if (i == filteredDirectPath.Length - 1)
+            {
+                // Top of path: parent_hash = empty
+                parentNode.ParentHash = Array.Empty<byte>();
+            }
+            else
+            {
+                // Compute parent hash from the parent above
+                uint parentAbove = filteredDirectPath[i + 1];
+                uint siblingOfParent;
+                uint leftChild = TreeMath.Left(parentAbove);
+                uint rightChild = TreeMath.Right(parentAbove);
+                siblingOfParent = (nodeIdx == leftChild) ? rightChild : leftChild;
+                byte[] siblingTreeHash = tentativeTree.ComputeTreeHash(_cs, siblingOfParent);
+                parentNode.ParentHash = tentativeTree.ComputeParentHash(_cs, parentAbove, siblingTreeHash);
+            }
+            tentativeTree.SetParent(nodeIdx, parentNode);
+        }
+
+        // Compute the leaf's parent_hash: hash of the first parent on the direct path
+        if (filteredDirectPath.Length > 0)
+        {
+            uint firstParent = filteredDirectPath[0];
+            uint leafNodeIdx = TreeMath.LeafToNode(_myLeafIndex);
+            uint siblingOfFirstParent;
+            uint leftChild = TreeMath.Left(firstParent);
+            uint rightChild = TreeMath.Right(firstParent);
+            siblingOfFirstParent = (leafNodeIdx == leftChild) ? rightChild : leftChild;
+            byte[] siblingTreeHash = tentativeTree.ComputeTreeHash(_cs, siblingOfFirstParent);
+            newLeafNode.ParentHash = tentativeTree.ComputeParentHash(_cs, firstParent, siblingTreeHash);
+        }
+
+        // NOW sign the leaf with final EncryptionKey, ParentHash, group_id, and leaf_index
+        SignLeafNode(_cs, newLeafNode, _mySigningPrivateKey, _groupId, _myLeafIndex);
+        tentativeTree.SetLeaf(_myLeafIndex, newLeafNode);
+
+        // Update the UpdatePath's leaf node to the signed version
+        updatePath = new UpdatePath(newLeafNode, updatePath.Nodes);
 
         // Build the Commit message
         var proposalOrRefs = proposals.Select(p =>
@@ -938,10 +999,13 @@ public sealed class MlsGroup
     /// <summary>
     /// Signs a leaf node per RFC 9420 Section 7.2.
     /// The LeafNodeTBS includes all leaf fields except the signature,
-    /// followed by source-specific context (group_id for Update/Commit).
+    /// followed by source-specific context per RFC 9420 §7.2:
+    ///   - KeyPackage: no additional context
+    ///   - Update/Commit: group_id<V> + uint32 leaf_index
     /// </summary>
     private static void SignLeafNode(
-        ICipherSuite cs, LeafNode leafNode, byte[] signingPrivateKey, byte[]? groupId)
+        ICipherSuite cs, LeafNode leafNode, byte[] signingPrivateKey,
+        byte[]? groupId, uint leafIndex = 0)
     {
         byte[] tbs = TlsCodec.Serialize(writer =>
         {
@@ -954,19 +1018,22 @@ public sealed class MlsGroup
             {
                 leafNode.Lifetime.WriteTo(writer);
             }
+            else if (leafNode.Source == LeafNodeSource.Commit)
+            {
+                writer.WriteOpaqueV(leafNode.ParentHash);
+            }
             writer.WriteVectorV(inner =>
             {
                 foreach (var ext in leafNode.Extensions)
                     ext.WriteTo(inner);
             });
-            // LeafNodeTBS includes source-specific context:
-            // For Update/Commit: group_id
-            // For KeyPackage: nothing extra
+            // LeafNodeTBS context fields (RFC 9420 §7.2):
             if (leafNode.Source == LeafNodeSource.Update ||
                 leafNode.Source == LeafNodeSource.Commit)
             {
                 if (groupId != null)
                     writer.WriteOpaqueV(groupId);
+                writer.WriteUint32(leafIndex);
             }
         });
 

@@ -1259,3 +1259,139 @@ public class MlsGroupLifecycleTests
         group.MergePendingCommit();
     }
 }
+
+// ================================================================
+// LeafNodeTBS Signature Verification Tests
+// ================================================================
+
+/// <summary>
+/// Tests that DotnetMls leaf node signatures are verifiable using the
+/// RFC 9420 §7.2 LeafNodeTBS format (with group_id + leaf_index for commit sources).
+/// </summary>
+public class LeafNodeSignatureTests
+{
+    private readonly CipherSuite0x0001 _cs = new();
+
+    /// <summary>
+    /// After CreateGroup + Commit (AddMember), the creator's leaf node has
+    /// Source=Commit. Its signature must verify against a TBS that includes
+    /// both group_id and leaf_index per RFC 9420 §7.2.
+    /// </summary>
+    [Fact]
+    public void CommitSourcedLeafNode_SignatureVerifies_WithLeafIndex()
+    {
+        // Create a group (creator gets Source=KeyPackage initially)
+        var identity = new byte[32];
+        System.Security.Cryptography.RandomNumberGenerator.Fill(identity);
+        var (sigPriv, sigPub) = _cs.GenerateSignatureKeyPair();
+        var group = MlsGroup.CreateGroup(_cs, identity, sigPriv, sigPub);
+
+        // Commit advances the creator's leaf to Source=Commit
+        var (commitMsg, welcome) = group.Commit();
+        group.MergePendingCommit();
+
+        // Extract the creator's leaf node (leaf index 0)
+        var tree = group.Tree;
+        var leaf = tree.GetLeaf(0);
+        Assert.NotNull(leaf);
+        Assert.Equal(LeafNodeSource.Commit, leaf!.Source);
+
+        // Build LeafNodeTBS per RFC 9420 §7.2 (correct format with leaf_index)
+        var groupId = group.GroupId;
+        uint leafIndex = 0;
+
+        byte[] tbs = TlsCodec.Serialize(writer =>
+        {
+            writer.WriteOpaqueV(leaf.EncryptionKey);
+            writer.WriteOpaqueV(leaf.SignatureKey);
+            leaf.Credential.WriteTo(writer);
+            leaf.Capabilities.WriteTo(writer);
+            writer.WriteUint8((byte)leaf.Source);
+
+            if (leaf.Source == LeafNodeSource.Commit)
+            {
+                writer.WriteOpaqueV(leaf.ParentHash);
+            }
+
+            writer.WriteVectorV(inner =>
+            {
+                foreach (var ext in leaf.Extensions)
+                    ext.WriteTo(inner);
+            });
+
+            // Context: group_id + leaf_index (required for Update/Commit per RFC 9420)
+            writer.WriteOpaqueV(groupId);
+            writer.WriteUint32(leafIndex);
+        });
+
+        bool valid = _cs.VerifyWithLabel(leaf.SignatureKey, "LeafNodeTBS", tbs, leaf.Signature);
+        Assert.True(valid,
+            "Leaf node signature verification failed. " +
+            "RFC 9420 §7.2 requires EncryptionKey (post-Encap), ParentHash, group_id, " +
+            "and leaf_index in the LeafNodeTBS for commit-sourced leaf nodes.");
+    }
+
+    /// <summary>
+    /// After AddMember, the Welcome contains a ratchet tree where the creator's
+    /// leaf has Source=Commit. The invitee must be able to verify this signature
+    /// using the RFC 9420 TBS format.
+    /// </summary>
+    [Fact]
+    public void AddMember_WelcomeTree_LeafSignatureVerifies()
+    {
+        // Create group with Alice
+        var aliceId = new byte[32];
+        System.Security.Cryptography.RandomNumberGenerator.Fill(aliceId);
+        var (aliceSigPriv, aliceSigPub) = _cs.GenerateSignatureKeyPair();
+        var aliceGroup = MlsGroup.CreateGroup(_cs, aliceId, aliceSigPriv, aliceSigPub);
+
+        // Generate Bob's KeyPackage
+        var bobId = new byte[32];
+        System.Security.Cryptography.RandomNumberGenerator.Fill(bobId);
+        var (bobSigPriv, bobSigPub) = _cs.GenerateSignatureKeyPair();
+        var bobKp = MlsGroup.CreateKeyPackage(_cs, bobId, bobSigPriv, bobSigPub,
+            out var bobInitPriv, out var bobHpkePriv);
+
+        // Alice adds Bob
+        var (commitMsg, welcome) = aliceGroup.Commit(new List<Proposal>
+        {
+            new AddProposal(bobKp)
+        });
+        Assert.NotNull(welcome);
+        aliceGroup.MergePendingCommit();
+
+        // Extract Alice's tree and verify her leaf signature
+        var tree = aliceGroup.Tree;
+        var aliceLeaf = tree.GetLeaf(0);
+        Assert.NotNull(aliceLeaf);
+        Assert.Equal(LeafNodeSource.Commit, aliceLeaf!.Source);
+
+        var groupId = aliceGroup.GroupId;
+        uint aliceLeafIndex = 0;
+
+        byte[] tbs = TlsCodec.Serialize(writer =>
+        {
+            writer.WriteOpaqueV(aliceLeaf.EncryptionKey);
+            writer.WriteOpaqueV(aliceLeaf.SignatureKey);
+            aliceLeaf.Credential.WriteTo(writer);
+            aliceLeaf.Capabilities.WriteTo(writer);
+            writer.WriteUint8((byte)aliceLeaf.Source);
+            writer.WriteOpaqueV(aliceLeaf.ParentHash);
+
+            writer.WriteVectorV(inner =>
+            {
+                foreach (var ext in aliceLeaf.Extensions)
+                    ext.WriteTo(inner);
+            });
+
+            // RFC 9420 §7.2: group_id + leaf_index for commit-sourced leaf
+            writer.WriteOpaqueV(groupId);
+            writer.WriteUint32(aliceLeafIndex);
+        });
+
+        bool valid = _cs.VerifyWithLabel(aliceLeaf.SignatureKey, "LeafNodeTBS", tbs, aliceLeaf.Signature);
+        Assert.True(valid,
+            "Welcome tree: Alice's commit-sourced leaf signature failed verification. " +
+            "DotnetMls SignLeafNode must include leaf_index in the LeafNodeTBS.");
+    }
+}
