@@ -1337,6 +1337,61 @@ public class LeafNodeSignatureTests
     /// using the RFC 9420 TBS format.
     /// </summary>
     [Fact]
+    public void Sibling_ClampedForNonFullTree()
+    {
+        // For 3 leaves: Sibling must use clamped right child
+        var cp = TreeMath.Copath(0, 3);
+        Assert.True(cp.All(n => n < TreeMath.NodeCount(3)),
+            $"Copath contains out-of-bounds node: [{string.Join(",", cp)}]");
+        Assert.Equal(new uint[] { 2, 4 }, cp); // Bob, Carol
+    }
+
+    [Fact]
+    public void Commit_ProducesPrivateMessage_ExistingMembersCanProcess()
+    {
+        // Setup: Alice creates group, adds Bob and Carol
+        var (aliceSigPriv, aliceSigPub) = _cs.GenerateSignatureKeyPair();
+        var aliceGroup = MlsGroup.CreateGroup(_cs, "alice"u8.ToArray(), aliceSigPriv, aliceSigPub);
+
+        var (bobSigPriv, bobSigPub) = _cs.GenerateSignatureKeyPair();
+        var bobKp = MlsGroup.CreateKeyPackage(_cs, "bob"u8.ToArray(), bobSigPriv, bobSigPub,
+            out var bobInitPriv, out var bobHpkePriv);
+
+        var (carolSigPriv, carolSigPub) = _cs.GenerateSignatureKeyPair();
+        var carolKp = MlsGroup.CreateKeyPackage(_cs, "carol"u8.ToArray(), carolSigPriv, carolSigPub,
+            out var carolInitPriv, out var carolHpkePriv);
+
+        // Alice adds Bob
+        var addBob = aliceGroup.ProposeAdd(new[] { bobKp });
+        var (_, welcomeBob) = aliceGroup.Commit(addBob);
+        aliceGroup.MergePendingCommit();
+        var bobGroup = MlsGroup.ProcessWelcome(_cs, welcomeBob!, bobKp, bobInitPriv, bobHpkePriv, bobSigPriv);
+
+        // Alice adds Carol — Bob must process this commit
+        var addCarol = aliceGroup.ProposeAdd(new[] { carolKp });
+        var (commitMsg, welcomeCarol) = aliceGroup.Commit(addCarol);
+        aliceGroup.MergePendingCommit();
+
+        // Commit should be a PrivateMessage (matching Rust MDK / marmot-ts wire format)
+        Assert.IsType<PrivateMessage>(commitMsg);
+
+        // Bob processes the PrivateMessage commit
+        bobGroup.ProcessCommit(commitMsg);
+        Assert.Equal(aliceGroup.Epoch, bobGroup.Epoch);
+
+        // Carol joins via Welcome
+        var carolGroup = MlsGroup.ProcessWelcome(_cs, welcomeCarol!, carolKp, carolInitPriv, carolHpkePriv, carolSigPriv);
+        Assert.Equal(aliceGroup.Epoch, carolGroup.Epoch);
+
+        // All three can exchange messages
+        var msg = aliceGroup.EncryptApplicationMessage("hello from alice"u8.ToArray());
+        var (dec1, _) = bobGroup.DecryptApplicationMessage(msg);
+        var (dec2, _) = carolGroup.DecryptApplicationMessage(msg);
+        Assert.Equal("hello from alice"u8.ToArray(), dec1);
+        Assert.Equal("hello from alice"u8.ToArray(), dec2);
+    }
+
+    [Fact]
     public void AddMember_WelcomeTree_LeafSignatureVerifies()
     {
         // Create group with Alice

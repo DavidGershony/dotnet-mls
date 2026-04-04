@@ -163,7 +163,7 @@ public static class TreeMath
         uint p = Parent(x, nodeCount);
 
         if (x < p)
-            return Right(p);
+            return RightClamped(p, nodeCount);
         else
             return Left(p);
     }

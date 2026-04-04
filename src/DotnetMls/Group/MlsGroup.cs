@@ -275,7 +275,7 @@ public sealed class MlsGroup
     /// </summary>
     /// <param name="proposals">The proposals to include, or null for an empty commit.</param>
     /// <returns>A tuple of (PublicMessage containing the Commit, Welcome for new members or null).</returns>
-    public (PublicMessage commitMessage, Welcome? welcome) Commit(List<Proposal>? proposals = null)
+    public (PrivateMessage commitMessage, Welcome? welcome) Commit(List<Proposal>? proposals = null)
     {
         proposals ??= new List<Proposal>();
 
@@ -419,7 +419,7 @@ public sealed class MlsGroup
         // Build the FramedContentTBS for signing and transcript hash
         byte[] serializedCurrentContext = SerializeGroupContext(_groupContext);
         byte[] tbs = MessageFraming.BuildFramedContentTbs(
-            WireFormat.MlsPublicMessage, framedContent, serializedCurrentContext);
+            WireFormat.MlsPrivateMessage, framedContent, serializedCurrentContext);
 
         // Compute new confirmed transcript hash
         // confirmed_transcript_hash = Hash(interim_transcript_hash || content_tbs)
@@ -451,12 +451,10 @@ public sealed class MlsGroup
         byte[] signature = _cs.SignWithLabel(_mySigningPrivateKey, "FramedContentTBS", tbs);
         var auth = new FramedContentAuthData(signature, confirmationTag);
 
-        // Compute membership tag using the CURRENT epoch's membership key
-        byte[] tbm = MessageFraming.BuildAuthenticatedContentTbm(
-            tbs, auth, ContentType.Commit);
-        byte[] membershipTag = _cs.Mac(_keySchedule.MembershipKey, tbm);
-
-        var publicMessage = new PublicMessage(framedContent, auth, membershipTag);
+        // Encrypt as PrivateMessage (matching Rust MDK / marmot-ts wire format)
+        var privateMessage = MessageFraming.EncryptPrivateMessage(
+            framedContent, auth, _cs, _secretTree,
+            _keySchedule.SenderDataSecret, _myLeafIndex, _config.Padding);
 
         // Build Welcome for new members
         Welcome? welcome = null;
@@ -481,7 +479,7 @@ public sealed class MlsGroup
             Extensions = tentativeExtensions
         };
 
-        return (publicMessage, welcome);
+        return (privateMessage, welcome);
     }
 
     // -- Merge pending commit --
@@ -527,9 +525,12 @@ public sealed class MlsGroup
     /// Thrown when the sender leaf is blank, the signature is invalid,
     /// or the confirmation tag is invalid.
     /// </exception>
-    public void ProcessCommit(PublicMessage commitMessage)
+    public void ProcessCommit(PrivateMessage commitMessage)
     {
-        var content = commitMessage.Content;
+        // Decrypt the PrivateMessage to recover FramedContent and auth
+        var (content, auth) = MessageFraming.DecryptPrivateMessage(
+            commitMessage, _cs, _secretTree, _keySchedule.SenderDataSecret);
+
         if (content.ContentType != ContentType.Commit)
             throw new ArgumentException("Not a commit message.");
 
@@ -543,8 +544,8 @@ public sealed class MlsGroup
         byte[] serializedContext = SerializeGroupContext(_groupContext);
 
         byte[] tbs = MessageFraming.BuildFramedContentTbs(
-            WireFormat.MlsPublicMessage, content, serializedContext);
-        if (!_cs.VerifyWithLabel(senderPublicKey, "FramedContentTBS", tbs, commitMessage.Auth.Signature))
+            WireFormat.MlsPrivateMessage, content, serializedContext);
+        if (!_cs.VerifyWithLabel(senderPublicKey, "FramedContentTBS", tbs, auth.Signature))
             throw new InvalidOperationException("Invalid commit signature.");
 
         // Parse the commit from the content bytes
@@ -585,6 +586,31 @@ public sealed class MlsGroup
             commitSecret = TreeKem.Decap(
                 tentativeTree, senderLeaf, commit.Path, _cs,
                 _myLeafIndex, _myHpkePrivateKey, tentativeContextBytes);
+
+            // Compute parent_hash for the sender's direct path per RFC 9420 §7.9.
+            // This must match what the sender computed during Commit().
+            var senderDirectPath = TreeMath.DirectPath(senderLeaf, tentativeTree.LeafCount);
+            for (int i = senderDirectPath.Length - 1; i >= 0; i--)
+            {
+                uint nodeIdx = senderDirectPath[i];
+                var parentNode = tentativeTree.GetParent(nodeIdx);
+                if (parentNode == null) continue;
+
+                if (i == senderDirectPath.Length - 1)
+                {
+                    parentNode.ParentHash = Array.Empty<byte>();
+                }
+                else
+                {
+                    uint parentAbove = senderDirectPath[i + 1];
+                    uint leftChild = TreeMath.Left(parentAbove);
+                    uint rightChild = TreeMath.Right(parentAbove);
+                    uint siblingOfParent = (nodeIdx == leftChild) ? rightChild : leftChild;
+                    byte[] siblingTreeHash = tentativeTree.ComputeTreeHash(_cs, siblingOfParent);
+                    parentNode.ParentHash = tentativeTree.ComputeParentHash(_cs, parentAbove, siblingTreeHash);
+                }
+                tentativeTree.SetParent(nodeIdx, parentNode);
+            }
         }
         else
         {
@@ -616,12 +642,12 @@ public sealed class MlsGroup
         // Verify confirmation tag
         byte[] expectedTag = newKeySchedule.ComputeConfirmationTag(
             _cs, newConfirmedTranscriptHash);
-        if (commitMessage.Auth.ConfirmationTag == null ||
-            !CryptographicOperations.FixedTimeEquals(expectedTag, commitMessage.Auth.ConfirmationTag))
+        if (auth.ConfirmationTag == null ||
+            !CryptographicOperations.FixedTimeEquals(expectedTag, auth.ConfirmationTag))
             throw new InvalidOperationException("Invalid confirmation tag.");
 
         byte[] newInterimTranscriptHash = _cs.Hash(
-            Concat(newConfirmedTranscriptHash, commitMessage.Auth.ConfirmationTag));
+            Concat(newConfirmedTranscriptHash, auth.ConfirmationTag));
 
         // Apply the new state
         _tree = tentativeTree;

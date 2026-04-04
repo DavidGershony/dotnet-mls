@@ -260,13 +260,29 @@ public static class MessageFraming
         uint senderLeafIndex,
         byte[] padding)
     {
-        // 1. Sign the content (using PrivateMessage wire format)
+        // Sign the content (using PrivateMessage wire format)
         byte[] tbs = BuildFramedContentTbs(WireFormat.MlsPrivateMessage, content, serializedGroupContext);
         byte[] signature = cs.SignWithLabel(signingPrivateKey, "FramedContentTBS", tbs);
-
         var auth = new FramedContentAuthData(signature, confirmationTag);
 
-        // 2. Get encryption key and nonce from secret tree
+        return EncryptPrivateMessage(content, auth, cs, secretTree, senderDataSecret, senderLeafIndex, padding);
+    }
+
+    /// <summary>
+    /// Encrypts a FramedContent into a PrivateMessage using pre-computed auth data.
+    /// Used by Commit() which needs to compute TBS/signature before encryption
+    /// for transcript hash computation.
+    /// </summary>
+    public static PrivateMessage EncryptPrivateMessage(
+        FramedContent content,
+        FramedContentAuthData auth,
+        ICipherSuite cs,
+        SecretTree secretTree,
+        byte[] senderDataSecret,
+        uint senderLeafIndex,
+        byte[] padding)
+    {
+        // 1. Get encryption key and nonce from secret tree
         // The secret tree advances the ratchet and returns the generation number.
         (byte[] key, byte[] nonce, uint generation) = content.ContentType == ContentType.Application
             ? secretTree.GetApplicationKeyAndNonce(senderLeafIndex)
