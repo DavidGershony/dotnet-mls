@@ -35,6 +35,8 @@ public sealed class HpkeX25519Aes128 : IHpke
     private static readonly byte[] BaseNonceLabel = Encoding.ASCII.GetBytes("base_nonce");
     private static readonly byte[] SharedSecretLabel = Encoding.ASCII.GetBytes("shared_secret");
     private static readonly byte[] EaePrkLabel = Encoding.ASCII.GetBytes("eae_prk");
+    private static readonly byte[] DkpPrkLabel = Encoding.ASCII.GetBytes("dkp_prk");
+    private static readonly byte[] SkLabel = Encoding.ASCII.GetBytes("sk");
     private static readonly byte[] EmptyBytes = Array.Empty<byte>();
 
     private readonly X25519Provider _x25519;
@@ -63,6 +65,19 @@ public sealed class HpkeX25519Aes128 : IHpke
     public (byte[] privateKey, byte[] publicKey) GenerateKeyPair()
     {
         return _x25519.GenerateKeyPair();
+    }
+
+    /// <inheritdoc />
+    public (byte[] privateKey, byte[] publicKey) DeriveKeyPair(byte[] ikm)
+    {
+        // RFC 9180 Section 7.1.3 (DHKEM(X25519)):
+        //   dkp_prk = LabeledExtract("", "dkp_prk", ikm)
+        //   sk = LabeledExpand(dkp_prk, "sk", "", Nsk=32)
+        //   return (sk, pk(sk))
+        var dkpPrk = LabeledExtractKem(EmptyBytes, DkpPrkLabel, ikm);
+        var sk = LabeledExpandKem(dkpPrk, SkLabel, EmptyBytes, 32);
+        var pk = _x25519.GetPublicKey(sk);
+        return (sk, pk);
     }
 
     /// <inheritdoc />

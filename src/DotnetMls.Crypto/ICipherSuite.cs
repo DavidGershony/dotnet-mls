@@ -119,6 +119,12 @@ public interface ICipherSuite
     (byte[] privateKey, byte[] publicKey) GenerateHpkeKeyPair();
 
     /// <summary>
+    /// Deterministically derives an HPKE key pair from input keying material.
+    /// Per RFC 9180 Section 7.1.3 (DHKEM): DeriveKeyPair(ikm).
+    /// </summary>
+    (byte[] privateKey, byte[] publicKey) DeriveHpkeKeyPair(byte[] ikm);
+
+    /// <summary>
     /// HPKE KEM Encap: generates a shared secret and KEM output for the given public key.
     /// </summary>
     (byte[] kem_output, byte[] shared_secret) HpkeEncap(byte[] publicKey);

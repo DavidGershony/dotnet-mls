@@ -36,6 +36,8 @@ public sealed class HpkeX25519ChaCha20 : IHpke
     private static readonly byte[] BaseNonceLabel = Encoding.ASCII.GetBytes("base_nonce");
     private static readonly byte[] SharedSecretLabel = Encoding.ASCII.GetBytes("shared_secret");
     private static readonly byte[] EaePrkLabel = Encoding.ASCII.GetBytes("eae_prk");
+    private static readonly byte[] DkpPrkLabel = Encoding.ASCII.GetBytes("dkp_prk");
+    private static readonly byte[] SkLabel = Encoding.ASCII.GetBytes("sk");
     private static readonly byte[] EmptyBytes = Array.Empty<byte>();
 
     private readonly X25519Provider _x25519;
@@ -56,6 +58,15 @@ public sealed class HpkeX25519ChaCha20 : IHpke
 
     /// <inheritdoc />
     public (byte[] privateKey, byte[] publicKey) GenerateKeyPair() => _x25519.GenerateKeyPair();
+
+    /// <inheritdoc />
+    public (byte[] privateKey, byte[] publicKey) DeriveKeyPair(byte[] ikm)
+    {
+        var dkpPrk = LabeledExtractKem(EmptyBytes, DkpPrkLabel, ikm);
+        var sk = LabeledExpandKem(dkpPrk, SkLabel, EmptyBytes, 32);
+        var pk = _x25519.GetPublicKey(sk);
+        return (sk, pk);
+    }
 
     /// <inheritdoc />
     public (byte[] kemOutput, byte[] sharedSecret) Encap(byte[] recipientPublicKey)

@@ -190,24 +190,8 @@ public sealed class KeyScheduleEpoch
         var newInitSecret = cs.DeriveSecret(epochSecret, "init");
 
         // Step 7: Derive the external HPKE public key from external_secret
-        // external_pub = DeriveKeyPair(external_secret).publicKey
-        // DeriveKeyPair uses the HPKE KEM; we approximate by using the cipher suite's
-        // HPKE key derivation. Per RFC 9420, DeriveKeyPair(ikm) produces a key pair
-        // from the input keying material. We use ExpandWithLabel to derive a private key
-        // and then compute the public key via the cipher suite.
-        //
-        // However, the ICipherSuite does not expose DeriveKeyPair directly.
-        // We derive a seed and use GenerateHpkeKeyPair's deterministic equivalent.
-        // For now, we store the external_secret and derive the key pair on demand.
-        // The public key is obtained by treating external_secret as HPKE private key material
-        // through the HPKE Encap/Decap mechanism.
-        //
-        // Per the spec, external_pub = KEM.DeriveKeyPair(external_secret).public_key
-        // We'll store a placeholder and let the caller compute this if needed,
-        // since ICipherSuite.GenerateHpkeKeyPair() is randomized, not deterministic from a seed.
-        //
-        // TODO: Add DeriveHpkeKeyPair(byte[] ikm) to ICipherSuite for deterministic key derivation.
-        var externalPub = Array.Empty<byte>();
+        // external_pub = KEM.DeriveKeyPair(external_secret).public_key
+        var (_, externalPub) = cs.DeriveHpkeKeyPair(externalSecret);
 
         // Step 8: Derive welcome key and nonce from welcome_secret
         // welcome_key = ExpandWithLabel(welcome_secret, "key", "", Nk)
@@ -302,8 +286,8 @@ public sealed class KeyScheduleEpoch
         var resumptionPsk = cs.DeriveSecret(epochSecret, "resumption");
         var newInitSecret = cs.DeriveSecret(epochSecret, "init");
 
-        // Step 6: external_pub placeholder (same as Create)
-        var externalPub = Array.Empty<byte>();
+        // Step 6: external_pub = KEM.DeriveKeyPair(external_secret).public_key
+        var (_, externalPub) = cs.DeriveHpkeKeyPair(externalSecret);
 
         // Step 7: Derive welcome key and nonce from welcome_secret
         var welcomeKey = cs.ExpandWithLabel(welcomeSecret, "key", Array.Empty<byte>(), cs.AeadKeySize);

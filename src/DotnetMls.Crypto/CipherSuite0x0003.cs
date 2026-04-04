@@ -158,6 +158,9 @@ public sealed class CipherSuite0x0003 : ICipherSuite
     public (byte[] privateKey, byte[] publicKey) GenerateHpkeKeyPair() => _hpke.GenerateKeyPair();
 
     /// <inheritdoc />
+    public (byte[] privateKey, byte[] publicKey) DeriveHpkeKeyPair(byte[] ikm) => _hpke.DeriveKeyPair(ikm);
+
+    /// <inheritdoc />
     public (byte[] kem_output, byte[] shared_secret) HpkeEncap(byte[] publicKey) => _hpke.Encap(publicKey);
 
     /// <inheritdoc />

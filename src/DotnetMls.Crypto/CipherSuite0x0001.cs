@@ -226,6 +226,12 @@ public sealed class CipherSuite0x0001 : ICipherSuite
     }
 
     /// <inheritdoc />
+    public (byte[] privateKey, byte[] publicKey) DeriveHpkeKeyPair(byte[] ikm)
+    {
+        return _hpke.DeriveKeyPair(ikm);
+    }
+
+    /// <inheritdoc />
     public (byte[] kem_output, byte[] shared_secret) HpkeEncap(byte[] publicKey)
     {
         return _hpke.Encap(publicKey);

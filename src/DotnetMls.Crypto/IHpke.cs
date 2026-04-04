@@ -12,6 +12,15 @@ public interface IHpke
     (byte[] privateKey, byte[] publicKey) GenerateKeyPair();
 
     /// <summary>
+    /// Deterministically derives a KEM key pair from input keying material.
+    /// Per RFC 9180 Section 7.1.3 (DHKEM):
+    ///   dkp_prk = LabeledExtract("", "dkp_prk", ikm)
+    ///   sk = LabeledExpand(dkp_prk, "sk", "", Nsk)
+    ///   return (sk, pk(sk))
+    /// </summary>
+    (byte[] privateKey, byte[] publicKey) DeriveKeyPair(byte[] ikm);
+
+    /// <summary>
     /// KEM Encap: generates a KEM output and shared secret for the recipient's public key.
     /// </summary>
     (byte[] kemOutput, byte[] sharedSecret) Encap(byte[] recipientPublicKey);
