@@ -7,21 +7,32 @@ namespace DotnetMls.Codec;
 /// </summary>
 public sealed class TlsReader
 {
+    /// <summary>
+    /// Default maximum size (in bytes) for any single length-prefixed element.
+    /// 4 MB is generous for MLS messages (large ratchet trees in big groups)
+    /// while blocking multi-GB allocations from malformed length prefixes.
+    /// </summary>
+    public const int DefaultMaxElementSize = 4 * 1024 * 1024;
+
     private readonly byte[] _data;
     private readonly int _offset;
     private readonly int _length;
+    private readonly int _maxElementSize;
     private int _position;
 
     /// <summary>
     /// Initializes a new <see cref="TlsReader"/> over the entire byte array.
     /// </summary>
     /// <param name="data">The data to read from.</param>
+    /// <param name="maxElementSize">Maximum allowed size for any single length-prefixed read.
+    /// Defaults to <see cref="DefaultMaxElementSize"/> (4 MB).</param>
     /// <exception cref="ArgumentNullException">Thrown when <paramref name="data"/> is null.</exception>
-    public TlsReader(byte[] data)
+    public TlsReader(byte[] data, int maxElementSize = DefaultMaxElementSize)
     {
         _data = data ?? throw new ArgumentNullException(nameof(data));
         _offset = 0;
         _length = data.Length;
+        _maxElementSize = maxElementSize;
         _position = 0;
     }
 
@@ -31,9 +42,11 @@ public sealed class TlsReader
     /// <param name="data">The data to read from.</param>
     /// <param name="offset">The starting offset within the array.</param>
     /// <param name="length">The number of bytes available for reading.</param>
+    /// <param name="maxElementSize">Maximum allowed size for any single length-prefixed read.
+    /// Defaults to <see cref="DefaultMaxElementSize"/> (4 MB).</param>
     /// <exception cref="ArgumentNullException">Thrown when <paramref name="data"/> is null.</exception>
     /// <exception cref="ArgumentOutOfRangeException">Thrown when <paramref name="offset"/> or <paramref name="length"/> are out of range.</exception>
-    public TlsReader(byte[] data, int offset, int length)
+    public TlsReader(byte[] data, int offset, int length, int maxElementSize = DefaultMaxElementSize)
     {
         ArgumentNullException.ThrowIfNull(data);
 
@@ -45,6 +58,7 @@ public sealed class TlsReader
         _data = data;
         _offset = offset;
         _length = length;
+        _maxElementSize = maxElementSize;
         _position = 0;
     }
 
@@ -147,6 +161,9 @@ public sealed class TlsReader
     {
         if (count < 0)
             throw new TlsDecodingException($"Cannot read a negative number of bytes ({count}).");
+        if (count > _maxElementSize)
+            throw new TlsDecodingException(
+                $"Element size {count} exceeds maximum allowed size of {_maxElementSize} bytes.");
 
         EnsureAvailable(count);
         var result = new byte[count];
@@ -349,7 +366,7 @@ public sealed class TlsReader
     private TlsReader ReadSubReader(int length)
     {
         EnsureAvailable(length);
-        var subReader = new TlsReader(_data, _offset + _position, length);
+        var subReader = new TlsReader(_data, _offset + _position, length, _maxElementSize);
         _position += length;
         return subReader;
     }
