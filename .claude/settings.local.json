@@ -1,0 +1,43 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "Bash(gh api:*)",
+      "Bash(dotnet test:*)",
+      "WebSearch",
+      "Bash(do echo:*)",
+      "Bash(python3:*)",
+      "WebFetch(domain:www.rfc-editor.org)",
+      "Bash(gh search:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(dotnet build:*)",
+      "WebFetch(domain:datatracker.ietf.org)",
+      "WebFetch(domain:www.ietf.org)",
+      "Bash(gh run:*)",
+      "Read(//c/Users/david/openCodeProjects/openChat/**)",
+      "Bash(dotnet restore)",
+      "Bash(git commit:*)",
+      "Read(//c/Users/david/openCodeProjects/marmot-cs/**)",
+      "Bash(find src:*)",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/LeastAuthority/marmot-protocol-mdk/master/crates/mdk-core/src/messages.rs\" -o /tmp/marmot_messages.rs)",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/LeastAuthority/marmot-protocol-mdk/master/crates/mdk-core/src/lib.rs\" -o /tmp/marmot_lib.rs)",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/LeastAuthority/marmot-protocol-mdk/master/crates/mdk-core/src/constant.rs\" -o /tmp/marmot_constant.rs)",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/LeastAuthority/marmot-protocol-mdk/master/crates/mdk-core/src/util.rs\" -o /tmp/marmot_util.rs)",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/LeastAuthority/marmot-protocol-mdk/master/crates/mdk-core/src/welcomes.rs\" -o /tmp/marmot_welcomes.rs)",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/LeastAuthority/marmot-protocol-mdk/master/crates/mdk-core/Cargo.toml\")",
+      "Bash(grep -v \"test\\\\|Test\\\\|//\")",
+      "WebFetch(domain:book.openmls.tech)",
+      "WebFetch(domain:latest.openmls.tech)",
+      "WebFetch(domain:docs.rs)",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/marmot-protocol/marmot/master/specs/02.md\")",
+      "Bash(curl -sL \"https://api.github.com/repos/marmot-protocol/marmot-ts/git/trees/main?recursive=1\")",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/marmot-protocol/marmot/master/specs/03.md\")",
+      "Bash(curl -sL \"https://api.github.com/repos/marmot-protocol/marmot-ts/contents/\")",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/marmot-protocol/marmot/master/specs/04.md\")",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/marmot-protocol/marmot/master/specs/05.md\")",
+      "Bash(curl -sL \"https://api.github.com/repos/marmot-protocol/marmot-ts/contents/src\")",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/marmot-protocol/marmot/master/README.md\")",
+      "Bash(curl:*)"
+    ]
+  }
+}

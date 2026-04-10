@@ -290,66 +290,50 @@ public static class TreeKem
     /// ExpandWithLabel and the public key is computed from it.
     ///
     /// Per RFC 9420 Section 7.6, DeriveKeyPair uses the KEM's DeriveKeyPair function.
-    /// Here we use ExpandWithLabel to derive the private key material, then
-    /// compute the public key.
+    /// For DHKEM(X25519), RFC 9180 Section 7.1.3:
+    ///   DeriveKeyPair(ikm):
+    ///     dkp_prk = LabeledExtract("", "dkp_prk", ikm)
+    ///     sk = LabeledExpand(dkp_prk, "sk", "", Nsk=32)
+    ///     return (sk, pk(sk))
     /// </summary>
-    private static (byte[] privateKey, byte[] publicKey) DeriveKeyPair(ICipherSuite cs, byte[] nodeSecret)
+    internal static (byte[] privateKey, byte[] publicKey) DeriveKeyPair(ICipherSuite cs, byte[] nodeSecret)
     {
-        // Derive the private key bytes from the node secret.
-        // We use ExpandWithLabel(node_secret, "key", "", 32) to get deterministic key material.
-        byte[] privKey = cs.ExpandWithLabel(nodeSecret, "key", Array.Empty<byte>(), 32);
+        // KEM suite_id for DHKEM(X25519, HKDF-SHA256) = "KEM" || I2OSP(0x0020, 2)
+        byte[] kemSuiteId = { 0x4B, 0x45, 0x4D, 0x00, 0x20 };
+        byte[] hpkeV1 = System.Text.Encoding.ASCII.GetBytes("HPKE-v1");
 
-        // Derive the public key by generating a key pair from the private key material.
-        // For X25519, the private key is the 32-byte secret and the public key is derived from it.
-        // We use GenerateHpkeKeyPair conceptually, but we need deterministic derivation.
-        // Instead, we extract+expand to get a deterministic key and derive the public key via
-        // the HPKE seal/open interface indirectly.
-        //
-        // The simplest correct approach: treat the derived bytes as an X25519 private key
-        // and derive the public key. Since ICipherSuite doesn't expose raw X25519 operations,
-        // we use the HpkeEncap/Decap identity: for any private key sk, the public key pk
-        // satisfies HpkeDecap(HpkeEncap(pk).kem_output, sk) == HpkeEncap(pk).shared_secret.
-        //
-        // However, since ICipherSuite.GenerateHpkeKeyPair uses random keys, we need a
-        // deterministic approach. We generate a key pair and keep only the private key part
-        // from our derivation. The public key is computed by HPKE KEM internally.
-        //
-        // For now, use the Extract/Expand approach to get deterministic key material that
-        // can be used with HPKE. The public key computation requires the X25519 scalar
-        // multiplication, which we achieve through the cipher suite's HPKE operations.
-        //
-        // Actually, the simplest and most portable approach: generate a fresh key pair,
-        // then derive the keypair deterministically by using the node secret as the seed
-        // for the KEM's DeriveKeyPair function. Since we have access to ExpandWithLabel,
-        // we can replicate what the RFC specifies.
-        //
-        // RFC 9420 Section 7.6 says:
-        //   node_priv[n], node_pub[n] = KEM.DeriveKeyPair(node_secret[n])
-        //
-        // For DHKEM(X25519), RFC 9180 Section 7.1.3:
-        //   DeriveKeyPair(ikm):
-        //     dkp_prk = LabeledExtract("", "dkp_prk", ikm)
-        //     sk = LabeledExpand(dkp_prk, "sk", "", Nsk=32)
-        //     return (sk, pk(sk))
-        //
-        // Since ICipherSuite exposes Extract/Expand but not the labeled HPKE variants,
-        // and since the HPKE layer wraps X25519, the practical approach is to use the
-        // nodeSecret bytes directly as seed material through Extract+Expand:
-        byte[] prk = cs.Extract(Array.Empty<byte>(), nodeSecret);
-        byte[] sk = cs.Expand(prk, System.Text.Encoding.UTF8.GetBytes("MLS 1.0 node key"), 32);
+        // LabeledExtract(salt="", label="dkp_prk", ikm=nodeSecret)
+        // labeled_ikm = "HPKE-v1" || suite_id || "dkp_prk" || ikm
+        byte[] dkpPrkLabel = System.Text.Encoding.ASCII.GetBytes("dkp_prk");
+        byte[] labeledIkm = ConcatBytes(hpkeV1, kemSuiteId, dkpPrkLabel, nodeSecret);
+        byte[] dkpPrk = cs.Extract(Array.Empty<byte>(), labeledIkm);
 
-        // To compute the public key from sk, we need the X25519 base point multiplication.
-        // We'll use a simple approach: seal a dummy plaintext to ourselves and extract the
-        // KEM output... but that's convoluted.
-        //
-        // Instead, since we know the underlying primitive is X25519 for suite 0x0001,
-        // we use the same BouncyCastle X25519 provider that the cipher suite uses internally.
-        // This is acceptable because TreeKem is a protocol-level operation that inherently
-        // depends on the KEM structure.
+        // LabeledExpand(dkp_prk, label="sk", info="", L=32)
+        // labeled_info = I2OSP(32, 2) || "HPKE-v1" || suite_id || "sk"
+        byte[] skLabel = System.Text.Encoding.ASCII.GetBytes("sk");
+        byte[] labeledInfo = ConcatBytes(new byte[] { 0x00, 0x20 }, hpkeV1, kemSuiteId, skLabel);
+        byte[] sk = cs.Expand(dkpPrk, labeledInfo, 32);
+
+        // Derive public key: pk = X25519(sk, basepoint)
         var x25519 = new X25519Provider();
         byte[] pk = x25519.GetPublicKey(sk);
 
         return (sk, pk);
+    }
+
+    /// <summary>Concatenates multiple byte arrays.</summary>
+    private static byte[] ConcatBytes(params byte[][] arrays)
+    {
+        int total = 0;
+        foreach (var a in arrays) total += a.Length;
+        var result = new byte[total];
+        int offset = 0;
+        foreach (var a in arrays)
+        {
+            Buffer.BlockCopy(a, 0, result, offset, a.Length);
+            offset += a.Length;
+        }
+        return result;
     }
 
     /// <summary>

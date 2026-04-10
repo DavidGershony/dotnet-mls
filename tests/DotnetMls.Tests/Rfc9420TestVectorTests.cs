@@ -1337,28 +1337,7 @@ public class Rfc9420TestVectorTests
     }
 
     /// <summary>
-    /// Derives the HPKE private key from a node secret using RFC 9180 §7.1.3 DeriveKeyPair.
-    /// For DHKEM(X25519): dkp_prk = LabeledExtract("", "dkp_prk", ikm),
-    /// sk = LabeledExpand(dkp_prk, "sk", "", 32)
-    /// </summary>
-    private static byte[] DeriveHpkePrivateKey(ICipherSuite cs, byte[] nodeSecret)
-    {
-        // KEM suite_id = "KEM" || I2OSP(0x0020, 2)
-        byte[] kemSuiteId = { 0x4B, 0x45, 0x4D, 0x00, 0x20 };
-        byte[] hpkeV1 = System.Text.Encoding.ASCII.GetBytes("HPKE-v1");
 
-        // LabeledExtract(salt="", label="dkp_prk", ikm=nodeSecret)
-        // labeled_ikm = "HPKE-v1" || suite_id || "dkp_prk" || ikm
-        byte[] dkpPrkLabel = System.Text.Encoding.ASCII.GetBytes("dkp_prk");
-        byte[] labeledIkm = Concat(Concat(Concat(hpkeV1, kemSuiteId), dkpPrkLabel), nodeSecret);
-        byte[] dkpPrk = cs.Extract(Array.Empty<byte>(), labeledIkm);
-
-        // LabeledExpand(dkp_prk, label="sk", info="", L=32)
-        // labeled_info = I2OSP(32, 2) || "HPKE-v1" || suite_id || "sk" || ""
-        byte[] skLabel = System.Text.Encoding.ASCII.GetBytes("sk");
-        byte[] labeledInfo = Concat(Concat(Concat(new byte[] { 0x00, 0x20 }, hpkeV1), kemSuiteId), skLabel);
-        return cs.Expand(dkpPrk, labeledInfo, 32);
-    }
 
     private static byte[] Concat(byte[] a, byte[] b, byte[] c)
     {
@@ -1849,7 +1828,7 @@ public class Rfc9420TestVectorTests
                 foreach (var ps in leafPriv.PathSecrets)
                 {
                     byte[] nodeSecret = cs.DeriveSecret(Hex(ps.PathSecret), "node");
-                    byte[] nodePriv = DeriveHpkePrivateKey(cs, nodeSecret);
+                    byte[] nodePriv = TreeKem.DeriveKeyPair(cs, nodeSecret).privateKey;
                     privateKeys[ps.Node] = nodePriv;
                 }
 
@@ -2164,7 +2143,7 @@ public class Rfc9420TestVectorTests
             for (int i = startIdx; i < myDp.Length; i++)
             {
                 byte[] nodeSecret = cs.DeriveSecret(pathSecret, "node");
-                byte[] nodePriv = DeriveHpkePrivateKey(cs, nodeSecret);
+                byte[] nodePriv = TreeKem.DeriveKeyPair(cs, nodeSecret).privateKey;
                 privateKeys[myDp[i]] = nodePriv;
                 // Store private key in tree node if it exists
                 var parentNode = tree.GetParent(myDp[i]);
@@ -2497,7 +2476,7 @@ public class Rfc9420TestVectorTests
             for (int i = copathPos; i < filteredDp.Count; i++)
             {
                 byte[] nodeSecret = cs.DeriveSecret(currentPathSecret, "node");
-                byte[] nodePriv = DeriveHpkePrivateKey(cs, nodeSecret);
+                byte[] nodePriv = TreeKem.DeriveKeyPair(cs, nodeSecret).privateKey;
                 newPrivateKeys[filteredDp[i]] = nodePriv;
                 tentativeTree.GetParent(filteredDp[i])!.PrivateKey = nodePriv;
 
