@@ -1,3 +1,4 @@
+using DotnetMls.Codec;
 using DotnetMls.Crypto;
 
 namespace DotnetMls.KeySchedule;
@@ -68,29 +69,33 @@ public sealed class TranscriptHash
     /// <summary>
     /// Updates the transcript hashes after processing a Commit.
     /// <para>
-    /// Computes:
+    /// Per RFC 9420 §8.2:
     /// <code>
-    ///   confirmed_transcript_hash = Hash(interim_transcript_hash || framedContentTbs)
-    ///   interim_transcript_hash   = Hash(confirmed_transcript_hash || confirmationTag)
+    ///   confirmed_transcript_hash = Hash(interim_transcript_hash || ConfirmedTranscriptHashInput)
+    ///   interim_transcript_hash   = Hash(confirmed_transcript_hash || InterimTranscriptHashInput)
     /// </code>
+    /// where ConfirmedTranscriptHashInput = wire_format || content || signature,
+    /// and InterimTranscriptHashInput = struct { MAC confirmation_tag; } with MAC = opaque&lt;V&gt;.
     /// </para>
     /// </summary>
     /// <param name="cs">The cipher suite providing the hash function.</param>
-    /// <param name="framedContentTbs">
-    /// The TLS-serialized FramedContentTBS for the Commit message.
-    /// This is the content that is signed by the committer.
+    /// <param name="confirmedTranscriptHashInput">
+    /// The serialized ConfirmedTranscriptHashInput: wire_format || FramedContent || signature.
     /// </param>
     /// <param name="confirmationTag">
-    /// The confirmation tag from the Commit's FramedContentAuthData.
+    /// The raw confirmation tag bytes from the Commit's FramedContentAuthData.
+    /// Will be wrapped as opaque&lt;V&gt; per RFC 9420 §8.2.
     /// </param>
-    public void Update(ICipherSuite cs, byte[] framedContentTbs, byte[] confirmationTag)
+    public void Update(ICipherSuite cs, byte[] confirmedTranscriptHashInput, byte[] confirmationTag)
     {
-        // confirmed_transcript_hash = Hash(interim_transcript_hash || framedContentTbs)
-        var confirmedInput = Concat(_interimTranscriptHash, framedContentTbs);
+        // confirmed_transcript_hash = Hash(interim_transcript_hash || ConfirmedTranscriptHashInput)
+        var confirmedInput = Concat(_interimTranscriptHash, confirmedTranscriptHashInput);
         _confirmedTranscriptHash = cs.Hash(confirmedInput);
 
-        // interim_transcript_hash = Hash(confirmed_transcript_hash || confirmationTag)
-        var interimInput = Concat(_confirmedTranscriptHash, confirmationTag);
+        // InterimTranscriptHashInput = struct { MAC confirmation_tag; }
+        // MAC is opaque<V>, so we serialize with VarInt length prefix per TLS presentation language.
+        byte[] interimTranscriptHashInput = TlsCodec.Serialize(w => w.WriteOpaqueV(confirmationTag));
+        var interimInput = Concat(_confirmedTranscriptHash, interimTranscriptHashInput);
         _interimTranscriptHash = cs.Hash(interimInput);
     }
 

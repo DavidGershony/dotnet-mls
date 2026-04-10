@@ -33,14 +33,19 @@ public static class TreeKem
     /// <param name="senderLeafIndex">The leaf index of the committer.</param>
     /// <param name="cs">The cipher suite.</param>
     /// <param name="newLeafNode">The updated leaf node for the committer.</param>
-    /// <param name="groupContext">Serialized group context, used as HPKE encryption context.</param>
+    /// <param name="groupContextFactory">Factory that returns the serialized provisional group context.
+    /// Called after the tree is updated with all new public keys but before encryption.
+    /// This allows the caller to compute the tree hash from the updated tree.</param>
+    /// <param name="addedLeaves">Leaf indices of members added in this commit.
+    /// Used to compute the filtered direct path per RFC 9420 §7.6.</param>
     /// <returns>A tuple of (UpdatePath to send, commitSecret for key schedule).</returns>
     public static (UpdatePath path, byte[] commitSecret) Encap(
         RatchetTree tree,
         uint senderLeafIndex,
         ICipherSuite cs,
         LeafNode newLeafNode,
-        byte[] groupContext)
+        Func<byte[]> groupContextFactory,
+        IReadOnlyList<uint>? addedLeaves = null)
     {
         uint leafCount = tree.LeafCount;
 
@@ -50,6 +55,30 @@ public static class TreeKem
         // Compute the direct path and copath
         var directPath = TreeMath.DirectPath(senderLeafIndex, leafCount);
         var copath = TreeMath.Copath(senderLeafIndex, leafCount);
+
+        // RFC 9420 §7.6: Compute filtered direct path — exclude entries whose
+        // copath child has empty resolution (considering added leaves as blank).
+        var addedNodeIndices = new HashSet<uint>();
+        if (addedLeaves != null)
+            foreach (var al in addedLeaves)
+                addedNodeIndices.Add(TreeMath.LeafToNode(al));
+
+        var filteredDp = new List<uint>();
+        var filteredCopath = new List<uint>();
+        for (int i = 0; i < directPath.Length; i++)
+        {
+            var res = tree.Resolution(copath[i]);
+            var encRes = res.Where(n => !addedNodeIndices.Contains(n)).ToList();
+            if (encRes.Count > 0)
+            {
+                filteredDp.Add(directPath[i]);
+                filteredCopath.Add(copath[i]);
+            }
+        }
+
+        // Blank the sender's direct path (all entries, not just filtered)
+        foreach (uint n in directPath)
+            tree.SetParent(n, null);
 
         // Generate the initial leaf secret
         byte[] pathSecret = cs.RandomBytes(cs.SecretSize);
@@ -61,47 +90,59 @@ public static class TreeKem
         newLeafNode.EncryptionKey = leafPub;
         tree.SetLeaf(senderLeafIndex, newLeafNode);
 
-        // Process each node on the direct path
-        var updatePathNodes = new List<UpdatePathNode>();
+        // Phase 1: Generate path secrets along the FILTERED direct path,
+        // derive key pairs and update tree nodes only for filtered entries.
+        var pathSecrets = new List<byte[]>();
+        var nodePubs = new List<byte[]>();
 
-        for (int i = 0; i < directPath.Length; i++)
+        for (int i = 0; i < filteredDp.Count; i++)
         {
-            uint nodeIndex = directPath[i];
+            uint nodeIndex = filteredDp[i];
 
             // Derive next path secret
             pathSecret = cs.DeriveSecret(pathSecret, "path");
+            pathSecrets.Add(pathSecret);
 
             // Derive node key pair
             byte[] nodeSecret = DeriveNodeSecret(cs, pathSecret);
             var (nodePriv, nodePub) = DeriveKeyPair(cs, nodeSecret);
+            nodePubs.Add(nodePub);
 
             // Update the parent node in the tree
-            var parentNode = tree.GetParent(nodeIndex) ?? new ParentNode();
+            var parentNode = new ParentNode();
             parentNode.EncryptionKey = nodePub;
             parentNode.PrivateKey = nodePriv;
-            parentNode.UnmergedLeaves = new List<uint>(); // Clear unmerged leaves
+            parentNode.UnmergedLeaves = new List<uint>();
             tree.SetParent(nodeIndex, parentNode);
+        }
 
-            // Encrypt the path secret to the resolution of the copath node
-            uint copathNode = copath[i];
+        // Phase 2: Encrypt path secrets to copath resolutions.
+        // Get the provisional context now that all public keys are set on the tree.
+        byte[] groupContext = groupContextFactory();
+        var updatePathNodes = new List<UpdatePathNode>();
+
+        for (int i = 0; i < filteredDp.Count; i++)
+        {
+            uint copathNode = filteredCopath[i];
             var resolution = tree.Resolution(copathNode);
+            // Exclude added members from encryption targets
+            var encResolution = resolution.Where(n => !addedNodeIndices.Contains(n)).ToList();
 
             var encryptedSecrets = new List<HpkeCiphertext>();
-            foreach (uint resNodeIndex in resolution)
+            foreach (uint resNodeIndex in encResolution)
             {
                 byte[] recipientPub = GetNodeEncryptionKey(tree, resNodeIndex);
                 if (recipientPub.Length == 0)
                     continue;
 
-                // HPKE encrypt: info = groupContext, aad = empty
-                var ciphertext = EncryptPathSecret(cs, pathSecret, recipientPub, groupContext);
+                var ciphertext = EncryptPathSecret(cs, pathSecrets[i], recipientPub, groupContext);
                 encryptedSecrets.Add(ciphertext);
             }
 
-            updatePathNodes.Add(new UpdatePathNode(nodePub, encryptedSecrets.ToArray()));
+            updatePathNodes.Add(new UpdatePathNode(nodePubs[i], encryptedSecrets.ToArray()));
         }
 
-        // Compute the commit secret: one more derivation beyond the last path secret
+        // Commit secret is derived from the last path secret
         byte[] commitSecret = cs.DeriveSecret(pathSecret, "path");
 
         var updatePath = new UpdatePath(newLeafNode, updatePathNodes.ToArray());
@@ -337,18 +378,22 @@ public static class TreeKem
     }
 
     /// <summary>
-    /// Encrypts a path secret to a recipient's public key using HPKE.
+    /// Encrypts a path secret to a recipient's public key using HPKE EncryptWithLabel.
+    /// Per RFC 9420 §7.6: EncryptWithLabel(node_pub, "UpdatePathNode", group_context, path_secret)
     /// </summary>
     private static HpkeCiphertext EncryptPathSecret(
         ICipherSuite cs, byte[] pathSecret, byte[] recipientPub, byte[] groupContext)
     {
-        // HPKE single-shot seal
-        // info = "MLS 1.0 UpdatePathNode" (group context is used as info)
-        // aad = group_context
-        byte[] sealed_ = cs.HpkeSeal(recipientPub, groupContext, Array.Empty<byte>(), pathSecret);
+        // Build EncryptWithLabel info: { opaque label<V>; opaque content<V>; }
+        // label = "MLS 1.0 UpdatePathNode", content = group_context
+        byte[] info = Codec.TlsCodec.Serialize(w =>
+        {
+            w.WriteOpaqueV(System.Text.Encoding.UTF8.GetBytes("MLS 1.0 UpdatePathNode"));
+            w.WriteOpaqueV(groupContext);
+        });
 
-        // HpkeSeal returns enc || ct, where enc is the KEM output (32 bytes for X25519)
-        // and ct is ciphertext + tag
+        byte[] sealed_ = cs.HpkeSeal(recipientPub, info, Array.Empty<byte>(), pathSecret);
+
         const int kemOutputSize = 32; // X25519 public key size
         byte[] kemOutput = new byte[kemOutputSize];
         byte[] ciphertext = new byte[sealed_.Length - kemOutputSize];
@@ -359,12 +404,19 @@ public static class TreeKem
     }
 
     /// <summary>
-    /// Decrypts a path secret from an HpkeCiphertext using the recipient's private key.
+    /// Decrypts a path secret from an HpkeCiphertext using HPKE DecryptWithLabel.
+    /// Per RFC 9420 §7.6: DecryptWithLabel(node_priv, "UpdatePathNode", group_context, kem_output, ciphertext)
     /// </summary>
     private static byte[] DecryptPathSecret(
         ICipherSuite cs, HpkeCiphertext ct, byte[] recipientPriv, byte[] groupContext)
     {
-        return cs.HpkeOpen(recipientPriv, ct.KemOutput, groupContext, Array.Empty<byte>(), ct.Ciphertext);
+        byte[] info = Codec.TlsCodec.Serialize(w =>
+        {
+            w.WriteOpaqueV(System.Text.Encoding.UTF8.GetBytes("MLS 1.0 UpdatePathNode"));
+            w.WriteOpaqueV(groupContext);
+        });
+
+        return cs.HpkeOpen(recipientPriv, ct.KemOutput, info, Array.Empty<byte>(), ct.Ciphertext);
     }
 
     /// <summary>

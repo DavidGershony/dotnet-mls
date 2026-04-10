@@ -41,6 +41,13 @@ public sealed class MlsGroup
     // Pending commit state (for the committer to merge after acknowledgement)
     private PendingCommitState? _pendingCommit;
 
+    // Proposal cache for standalone proposals referenced by hash in Commits
+    private readonly Dictionary<string, (Proposal Proposal, uint SenderLeaf)> _proposalCache = new();
+
+    // PSK stores for resumption and external PSKs
+    private readonly Dictionary<ulong, byte[]> _resumptionPsks = new();
+    private readonly Dictionary<string, byte[]> _externalPsks = new();
+
     // -- Properties --
 
     /// <summary>The unique group identifier.</summary>
@@ -284,6 +291,7 @@ public sealed class MlsGroup
 
         // Apply proposals to the tentative tree and collect new members
         var newMembers = new List<(KeyPackage kp, byte[] initKey)>();
+        var addedLeaves = new List<uint>();
         var tentativeExtensions = (Extension[])_extensions.Clone();
 
         foreach (var proposal in proposals)
@@ -291,7 +299,8 @@ public sealed class MlsGroup
             if (proposal is AddProposal add)
             {
                 var leafNode = add.KeyPackage.LeafNode;
-                tentativeTree.AddLeaf(leafNode);
+                uint newIdx = tentativeTree.AddLeaf(leafNode);
+                addedLeaves.Add(newIdx);
                 newMembers.Add((add.KeyPackage, add.KeyPackage.InitKey));
             }
             else if (proposal is RemoveProposal remove)
@@ -321,79 +330,95 @@ public sealed class MlsGroup
         // NOTE: Do NOT sign yet — Encap will set the final EncryptionKey,
         // and we need to compute parent_hash first.
 
-        // Build tentative group context for TreeKEM (with placeholders)
+        // Build tentative group context for TreeKEM.
+        // RFC 9420 §12.4.2: The provisional GroupContext uses epoch+1, the
+        // tree hash AFTER public state is applied, and the OLD confirmed_transcript_hash.
         var tentativeContext = new GroupContext
         {
             Version = ProtocolVersion.Mls10,
             CipherSuite = _cs.Id,
             GroupId = _groupId,
             Epoch = _epoch + 1,
-            TreeHash = Array.Empty<byte>(),
-            ConfirmedTranscriptHash = Array.Empty<byte>(),
+            TreeHash = Array.Empty<byte>(), // filled by factory below
+            ConfirmedTranscriptHash = _groupContext.ConfirmedTranscriptHash,
             Extensions = tentativeExtensions
         };
-        byte[] tentativeContextBytes = SerializeGroupContext(tentativeContext);
+
+        // Save tree BEFORE Encap modifies it (for sibling tree hash in parent_hash)
+        var originalTree = tentativeTree.Clone();
 
         // Run TreeKEM Encap: derives path secrets, sets parent nodes, and
         // overwrites newLeafNode.EncryptionKey with the Encap-derived leaf key.
+        // The groupContext factory is called after the tree is updated with all
+        // new public keys (Phase 1) but before encryption (Phase 2).
+        // Inside the factory, we compute parent hashes, add unmerged leaves for
+        // added members, and sign the leaf so the tree hash matches ProcessCommitCore.
         var (updatePath, commitSecret) = TreeKem.Encap(
-            tentativeTree, _myLeafIndex, _cs, newLeafNode, tentativeContextBytes);
-
-        // Compute parent_hash for the committer's leaf per RFC 9420 §7.9.
-        // Walk the filtered direct path in reverse to propagate parent hashes downward.
-        var filteredDirectPath = TreeMath.DirectPath(_myLeafIndex, tentativeTree.LeafCount);
-        for (int i = filteredDirectPath.Length - 1; i >= 0; i--)
-        {
-            uint nodeIdx = filteredDirectPath[i];
-            var parentNode = tentativeTree.GetParent(nodeIdx);
-            if (parentNode == null) continue;
-
-            // Find the sibling of this node
-            uint siblingIdx = (i + 1 < filteredDirectPath.Length)
-                ? filteredDirectPath[i + 1]
-                : TreeMath.Root(tentativeTree.LeafCount);
-
-            // The "original sibling tree hash" is the sibling's tree hash BEFORE this commit.
-            // For simplicity, use the current tree hash (the tree has already been updated by Encap).
-            // RFC 9420 §7.9 says to use the tree hash of the original tree for the sibling.
-            // For a correct implementation, we'd need the pre-commit tree hashes.
-            // However, the parent at the top of the path has ParentHash = empty (root).
-            if (i == filteredDirectPath.Length - 1)
+            tentativeTree, _myLeafIndex, _cs, newLeafNode, () =>
             {
-                // Top of path: parent_hash = empty
-                parentNode.ParentHash = Array.Empty<byte>();
-            }
-            else
-            {
-                // Compute parent hash from the parent above
-                uint parentAbove = filteredDirectPath[i + 1];
-                uint siblingOfParent;
-                uint leftChild = TreeMath.Left(parentAbove);
-                uint rightChild = TreeMath.Right(parentAbove);
-                siblingOfParent = (nodeIdx == leftChild) ? rightChild : leftChild;
-                byte[] siblingTreeHash = tentativeTree.ComputeTreeHash(_cs, siblingOfParent);
-                parentNode.ParentHash = tentativeTree.ComputeParentHash(_cs, parentAbove, siblingTreeHash);
-            }
-            tentativeTree.SetParent(nodeIdx, parentNode);
-        }
+                // Compute filtered direct path (same as what Encap uses internally)
+                var dp = TreeMath.DirectPath(_myLeafIndex, tentativeTree.LeafCount);
+                var addedNodeIndices = new HashSet<uint>(addedLeaves.Select(l => TreeMath.LeafToNode(l)));
+                var cp = TreeMath.Copath(_myLeafIndex, tentativeTree.LeafCount);
+                var fdp = new List<uint>();
+                for (int i = 0; i < dp.Length; i++)
+                {
+                    var res = tentativeTree.Resolution(cp[i]);
+                    if (res.Any(n => !addedNodeIndices.Contains(n)))
+                        fdp.Add(dp[i]);
+                }
 
-        // Compute the leaf's parent_hash: hash of the first parent on the direct path
-        if (filteredDirectPath.Length > 0)
-        {
-            uint firstParent = filteredDirectPath[0];
-            uint leafNodeIdx = TreeMath.LeafToNode(_myLeafIndex);
-            uint siblingOfFirstParent;
-            uint leftChild = TreeMath.Left(firstParent);
-            uint rightChild = TreeMath.Right(firstParent);
-            siblingOfFirstParent = (leafNodeIdx == leftChild) ? rightChild : leftChild;
-            byte[] siblingTreeHash = tentativeTree.ComputeTreeHash(_cs, siblingOfFirstParent);
-            newLeafNode.ParentHash = tentativeTree.ComputeParentHash(_cs, firstParent, siblingTreeHash);
-        }
+                // Compute parent hashes on the filtered DP (from root down)
+                for (int i = fdp.Count - 2; i >= 0; i--)
+                {
+                    uint nodeIdx = fdp[i];
+                    uint parentIdx = fdp[i + 1];
+                    uint siblingIdx = nodeIdx < parentIdx
+                        ? TreeMath.Right(parentIdx)
+                        : TreeMath.Left(parentIdx);
+                    byte[] siblingTreeHash = originalTree.ComputeTreeHash(_cs, siblingIdx);
+                    byte[] parentHash = tentativeTree.ComputeParentHash(_cs, parentIdx, siblingTreeHash);
+                    tentativeTree.GetParent(nodeIdx)!.ParentHash = parentHash;
+                }
 
-        // NOW sign the leaf with final EncryptionKey, ParentHash, group_id, and leaf_index
-        SignLeafNode(_cs, newLeafNode, _mySigningPrivateKey, _groupId, _myLeafIndex);
-        tentativeTree.SetLeaf(_myLeafIndex, newLeafNode);
+                // Compute the leaf's parent_hash
+                if (fdp.Count > 0)
+                {
+                    uint firstParent = fdp[0];
+                    uint leafNodeIdx = TreeMath.LeafToNode(_myLeafIndex);
+                    uint lc = TreeMath.Left(firstParent);
+                    uint rc = TreeMath.Right(firstParent);
+                    uint siblingOfFirst = (leafNodeIdx == lc) ? rc : lc;
+                    byte[] siblingTreeHash = originalTree.ComputeTreeHash(_cs, siblingOfFirst);
+                    newLeafNode.ParentHash = tentativeTree.ComputeParentHash(_cs, firstParent, siblingTreeHash);
+                }
 
+                // Sign the leaf with final EncryptionKey, ParentHash, and group context
+                SignLeafNode(_cs, newLeafNode, _mySigningPrivateKey, _groupId, _myLeafIndex);
+                tentativeTree.SetLeaf(_myLeafIndex, newLeafNode);
+
+                // Add unmerged leaves for added members on non-filtered ancestors
+                var fdpSet = new HashSet<uint>(fdp);
+                foreach (uint addedLeaf in addedLeaves)
+                {
+                    var addedDp2 = TreeMath.DirectPath(addedLeaf, tentativeTree.LeafCount);
+                    foreach (uint dpNode in addedDp2)
+                    {
+                        if (!fdpSet.Contains(dpNode))
+                        {
+                            var pn = tentativeTree.GetParent(dpNode);
+                            if (pn != null)
+                                pn.UnmergedLeaves.Add(addedLeaf);
+                        }
+                    }
+                }
+
+                var root = TreeMath.Root(tentativeTree.LeafCount);
+                tentativeContext.TreeHash = tentativeTree.ComputeTreeHash(_cs, root);
+                return SerializeGroupContext(tentativeContext);
+            }, addedLeaves);
+
+        // Parent hashes and leaf signing are done inside the Encap factory above.
         // Update the UpdatePath's leaf node to the signed version
         updatePath = new UpdatePath(newLeafNode, updatePath.Nodes);
 
@@ -416,19 +441,28 @@ public sealed class MlsGroup
             Content = commitBytes
         };
 
-        // Build the FramedContentTBS for signing and transcript hash
+        // Build the FramedContentTBS for signing
         byte[] serializedCurrentContext = SerializeGroupContext(_groupContext);
         byte[] tbs = MessageFraming.BuildFramedContentTbs(
             WireFormat.MlsPrivateMessage, framedContent, serializedCurrentContext);
 
-        // Compute new confirmed transcript hash
-        // confirmed_transcript_hash = Hash(interim_transcript_hash || content_tbs)
-        byte[] newConfirmedTranscriptHash = _cs.Hash(
-            Concat(_transcriptHash.InterimTranscriptHash, tbs));
+        // Sign the FramedContent BEFORE computing transcript hash,
+        // since ConfirmedTranscriptHashInput includes the signature (RFC 9420 §8.2).
+        byte[] signature = _cs.SignWithLabel(_mySigningPrivateKey, "FramedContentTBS", tbs);
+
+        // Compute new confirmed transcript hash per RFC 9420 §8.2:
+        // ConfirmedTranscriptHashInput = wire_format || content || signature
+        byte[] confirmedInput = MessageFraming.BuildConfirmedTranscriptHashInput(
+            WireFormat.MlsPrivateMessage, framedContent, signature);
+        var tentativeTranscriptHash = _transcriptHash.Clone();
 
         // Compute tree hash of the updated tree
         var root = TreeMath.Root(tentativeTree.LeafCount);
         byte[] treeHash = tentativeTree.ComputeTreeHash(_cs, root);
+
+        // Build tentative confirmed hash to derive key schedule and confirmation tag
+        byte[] newConfirmedTranscriptHash = _cs.Hash(
+            Concat(_transcriptHash.InterimTranscriptHash, confirmedInput));
 
         // Finalize the group context with real values
         tentativeContext.TreeHash = treeHash;
@@ -443,12 +477,10 @@ public sealed class MlsGroup
         byte[] confirmationTag = newKeySchedule.ComputeConfirmationTag(
             _cs, newConfirmedTranscriptHash);
 
-        // Compute interim transcript hash
-        byte[] newInterimTranscriptHash = _cs.Hash(
-            Concat(newConfirmedTranscriptHash, confirmationTag));
+        // Update transcript hash with both confirmed and interim
+        tentativeTranscriptHash.Update(_cs, confirmedInput, confirmationTag);
+        byte[] newInterimTranscriptHash = tentativeTranscriptHash.InterimTranscriptHash;
 
-        // Sign the FramedContent
-        byte[] signature = _cs.SignWithLabel(_mySigningPrivateKey, "FramedContentTBS", tbs);
         var auth = new FramedContentAuthData(signature, confirmationTag);
 
         // Encrypt as PrivateMessage (matching Rust MDK / marmot-ts wire format)
@@ -531,10 +563,70 @@ public sealed class MlsGroup
         var (content, auth) = MessageFraming.DecryptPrivateMessage(
             commitMessage, _cs, _secretTree, _keySchedule.SenderDataSecret);
 
+        ProcessCommitCore(content, auth, WireFormat.MlsPrivateMessage);
+    }
+
+    /// <summary>
+    /// Processes a Commit received as a PublicMessage, transitioning to the new epoch.
+    /// Verifies the membership tag, signature, confirmation tag, and applies all proposals.
+    /// </summary>
+    public void ProcessCommit(PublicMessage commitMessage)
+    {
+        var content = commitMessage.Content;
+        var auth = commitMessage.Auth;
+
+        // Verify membership tag for public messages
+        byte[] serializedContext = SerializeGroupContext(_groupContext);
+        bool valid = MessageFraming.VerifyPublicMessage(
+            commitMessage,
+            _tree.GetLeaf(content.Sender.LeafIndex)!.SignatureKey,
+            serializedContext,
+            _cs,
+            _keySchedule.MembershipKey);
+        if (!valid)
+            throw new InvalidOperationException("Invalid public message signature or membership tag.");
+
+        ProcessCommitCore(content, auth, WireFormat.MlsPublicMessage);
+    }
+
+    /// <summary>
+    /// Caches a standalone proposal (received as a PublicMessage) for later reference
+    /// in a Commit via ProposalReference.
+    /// </summary>
+    public void CacheProposal(PublicMessage proposalMessage)
+    {
+        var content = proposalMessage.Content;
+        var auth = proposalMessage.Auth;
+
+        // Build AuthenticatedContent = wire_format || content || auth
+        byte[] authContent = TlsCodec.Serialize(w =>
+        {
+            w.WriteUint16((ushort)WireFormat.MlsPublicMessage);
+            content.WriteTo(w);
+            auth.WriteTo(w, content.ContentType);
+        });
+
+        // Compute ProposalRef = RefHash("MLS 1.0 Proposal Reference", AuthenticatedContent)
+        byte[] propRef = _cs.RefHash("MLS 1.0 Proposal Reference", authContent);
+        string refKey = Convert.ToHexString(propRef).ToLowerInvariant();
+
+        var proposal = Proposal.ReadFrom(new TlsReader(content.Content));
+        _proposalCache[refKey] = (proposal, content.Sender.LeafIndex);
+    }
+
+    /// <summary>
+    /// Core commit processing shared between PrivateMessage and PublicMessage paths.
+    /// Implements RFC 9420 §12.4 commit processing.
+    /// </summary>
+    private void ProcessCommitCore(
+        FramedContent content,
+        FramedContentAuthData auth,
+        WireFormat wireFormat)
+    {
         if (content.ContentType != ContentType.Commit)
             throw new ArgumentException("Not a commit message.");
 
-        // Verify signature
+        // Verify signature using CURRENT group context
         uint senderLeaf = content.Sender.LeafIndex;
         var senderLeafNode = _tree.GetLeaf(senderLeaf);
         if (senderLeafNode == null)
@@ -544,85 +636,275 @@ public sealed class MlsGroup
         byte[] serializedContext = SerializeGroupContext(_groupContext);
 
         byte[] tbs = MessageFraming.BuildFramedContentTbs(
-            WireFormat.MlsPrivateMessage, content, serializedContext);
+            wireFormat, content, serializedContext);
         if (!_cs.VerifyWithLabel(senderPublicKey, "FramedContentTBS", tbs, auth.Signature))
             throw new InvalidOperationException("Invalid commit signature.");
 
-        // Parse the commit from the content bytes
-        var commitReader = new TlsReader(content.Content);
-        var commit = Types.Commit.ReadFrom(commitReader);
+        // Parse the commit
+        var commit = Types.Commit.ReadFrom(new TlsReader(content.Content));
 
         // Clone tree for tentative processing
         var tentativeTree = _tree.Clone();
         var tentativeExtensions = (Extension[])_extensions.Clone();
 
-        // Apply proposals
+        // ---- RFC 9420 §12.4: Resolve proposals by type ----
+        // Proposals are applied in type order: GCE → Update → Remove (desc) → Add
+        // PSK proposals don't modify the tree but are collected in commit order.
+        var pskIds = new List<PreSharedKeyId>();
+        var updates = new List<(UpdateProposal Prop, uint SenderLeaf)>();
+        var removes = new List<RemoveProposal>();
+        var adds = new List<AddProposal>();
+        var gces = new List<GroupContextExtensionsProposal>();
+
         foreach (var por in commit.Proposals)
         {
+            Proposal proposal;
+            uint proposerLeaf = senderLeaf;
             if (por is InlineProposal inline)
             {
-                ApplyProposal(tentativeTree, inline.Proposal, ref tentativeExtensions);
+                proposal = inline.Proposal;
             }
-            // ProposalReference handling would require a proposal cache (not yet implemented)
+            else if (por is ProposalReference pref)
+            {
+                string refKey = Convert.ToHexString(pref.Reference).ToLowerInvariant();
+                if (!_proposalCache.TryGetValue(refKey, out var cached))
+                    throw new InvalidOperationException($"Unknown proposal reference: {refKey}");
+                proposal = cached.Proposal;
+                proposerLeaf = cached.SenderLeaf;
+            }
+            else
+            {
+                continue;
+            }
+
+            if (proposal is AddProposal add) adds.Add(add);
+            else if (proposal is RemoveProposal remove) removes.Add(remove);
+            else if (proposal is UpdateProposal update) updates.Add((update, proposerLeaf));
+            else if (proposal is PreSharedKeyProposal pskProp) pskIds.Add(pskProp.Psk);
+            else if (proposal is GroupContextExtensionsProposal gce) gces.Add(gce);
         }
 
-        // Process UpdatePath if present
+        // Apply in type order: GCE → Update → Remove → Add
+        foreach (var gce in gces)
+            tentativeExtensions = gce.Extensions;
+
+        foreach (var (update, propLeaf) in updates)
+        {
+            tentativeTree.SetLeaf(propLeaf, update.LeafNode);
+            var updateDp = TreeMath.DirectPath(propLeaf, tentativeTree.LeafCount);
+            foreach (uint dpNode in updateDp)
+                tentativeTree.SetParent(dpNode, null);
+        }
+
+        foreach (var remove in removes.OrderByDescending(r => r.LeafIndex))
+        {
+            // Clean unmerged_leaves for removed member
+            for (int ni = 1; ni < tentativeTree.NodeCount; ni += 2)
+            {
+                var pn = tentativeTree.GetParent((uint)ni);
+                if (pn != null)
+                    pn.UnmergedLeaves.Remove(remove.LeafIndex);
+            }
+            uint removeNodeIdx = TreeMath.LeafToNode(remove.LeafIndex);
+            tentativeTree.SetNode(removeNodeIdx, new TreeNode.Leaf(null));
+            var removeDp = TreeMath.DirectPath(remove.LeafIndex, tentativeTree.LeafCount);
+            foreach (uint dpNode in removeDp)
+                tentativeTree.SetParent(dpNode, null);
+        }
+
+        // Trim tree after all removes
+        if (removes.Count > 0)
+            tentativeTree.TrimTree();
+
+        var addedLeaves = new List<uint>();
+        foreach (var add in adds)
+        {
+            uint newLeafIdx = tentativeTree.AddLeaf(add.KeyPackage.LeafNode);
+            addedLeaves.Add(newLeafIdx);
+        }
+
+        // ---- Process UpdatePath if present ----
         byte[] commitSecret;
         if (commit.Path != null)
         {
-            // Build tentative context for Decap
-            var tentativeContext = new GroupContext
+            // Save tree state AFTER proposals but BEFORE UpdatePath for sibling tree hash
+            var originalTree = tentativeTree.Clone();
+
+            // Apply UpdatePath public state to tentative tree
+            tentativeTree.SetLeaf(senderLeaf, commit.Path.LeafNode);
+            var senderDp = TreeMath.DirectPath(senderLeaf, tentativeTree.LeafCount);
+            var senderCopath = TreeMath.Copath(senderLeaf, tentativeTree.LeafCount);
+            foreach (uint n in senderDp)
+                tentativeTree.SetParent(n, null);
+
+            // RFC 9420 §7.6: Filtered direct path excludes entries whose copath
+            // child has empty resolution (excluding newly added members).
+            var addedNodeIndices = new HashSet<uint>(addedLeaves.Select(l => TreeMath.LeafToNode(l)));
+            var filteredDp = new List<uint>();
+            var filteredCopath = new List<uint>();
+            for (int i = 0; i < senderDp.Length; i++)
+            {
+                var res = tentativeTree.Resolution(senderCopath[i]);
+                var encRes = res.Where(n => !addedNodeIndices.Contains(n)).ToList();
+                if (encRes.Count > 0)
+                {
+                    filteredDp.Add(senderDp[i]);
+                    filteredCopath.Add(senderCopath[i]);
+                }
+            }
+
+            // Set public keys from UpdatePath on filtered direct path nodes
+            for (int i = 0; i < filteredDp.Count; i++)
+            {
+                tentativeTree.SetParent(filteredDp[i], new ParentNode
+                {
+                    EncryptionKey = commit.Path.Nodes[i].EncryptionKey,
+                    UnmergedLeaves = new List<uint>(),
+                });
+            }
+
+            // Compute parent hashes (from root down) — needed before provisional tree hash
+            for (int i = filteredDp.Count - 2; i >= 0; i--)
+            {
+                uint nodeIdx = filteredDp[i];
+                uint parentIdx = filteredDp[i + 1];
+                uint siblingIdx = nodeIdx < parentIdx
+                    ? TreeMath.Right(parentIdx)
+                    : TreeMath.Left(parentIdx);
+                byte[] siblingTreeHash = originalTree.ComputeTreeHash(_cs, siblingIdx);
+                byte[] parentHash = tentativeTree.ComputeParentHash(_cs, parentIdx, siblingTreeHash);
+                tentativeTree.GetParent(nodeIdx)!.ParentHash = parentHash;
+            }
+
+            // RFC 9420 §12.4.2 step 5: For each added member, add to unmerged_leaves
+            // of each non-blank ancestor NOT on the sender's filtered direct path.
+            var filteredDpSet = new HashSet<uint>(filteredDp);
+            foreach (uint addedLeaf in addedLeaves)
+            {
+                var addedDp = TreeMath.DirectPath(addedLeaf, tentativeTree.LeafCount);
+                foreach (uint dpNode in addedDp)
+                {
+                    if (!filteredDpSet.Contains(dpNode))
+                    {
+                        var pn = tentativeTree.GetParent(dpNode);
+                        if (pn != null)
+                            pn.UnmergedLeaves.Add(addedLeaf);
+                    }
+                }
+            }
+
+            // Compute provisional tree hash for HPKE context
+            // (includes parent hashes and unmerged leaves)
+            uint root = TreeMath.Root(tentativeTree.LeafCount);
+            byte[] provisionalTreeHash = tentativeTree.ComputeTreeHash(_cs, root);
+
+            // RFC 9420 §12.4.2: Provisional GroupContext for EncryptWithLabel uses
+            // new epoch + new tree_hash but OLD confirmed_transcript_hash.
+            var provisionalGroupContext = new GroupContext
             {
                 Version = ProtocolVersion.Mls10,
                 CipherSuite = _cs.Id,
                 GroupId = _groupId,
                 Epoch = _epoch + 1,
-                TreeHash = Array.Empty<byte>(),
-                ConfirmedTranscriptHash = Array.Empty<byte>(),
-                Extensions = tentativeExtensions
+                TreeHash = provisionalTreeHash,
+                ConfirmedTranscriptHash = _groupContext.ConfirmedTranscriptHash,
+                Extensions = tentativeExtensions,
             };
-            byte[] tentativeContextBytes = SerializeGroupContext(tentativeContext);
+            byte[] provisionalCtxBytes = SerializeGroupContext(provisionalGroupContext);
 
-            commitSecret = TreeKem.Decap(
-                tentativeTree, senderLeaf, commit.Path, _cs,
-                _myLeafIndex, _myHpkePrivateKey, tentativeContextBytes);
-
-            // Compute parent_hash for the sender's direct path per RFC 9420 §7.9.
-            // This must match what the sender computed during Commit().
-            var senderDirectPath = TreeMath.DirectPath(senderLeaf, tentativeTree.LeafCount);
-            for (int i = senderDirectPath.Length - 1; i >= 0; i--)
+            // Build EncryptWithLabel info: { opaque label<V>; opaque content<V>; }
+            byte[] provisionalEncryptInfo = TlsCodec.Serialize(w =>
             {
-                uint nodeIdx = senderDirectPath[i];
-                var parentNode = tentativeTree.GetParent(nodeIdx);
-                if (parentNode == null) continue;
+                w.WriteOpaqueV(System.Text.Encoding.UTF8.GetBytes("MLS 1.0 UpdatePathNode"));
+                w.WriteOpaqueV(provisionalCtxBytes);
+            });
 
-                if (i == senderDirectPath.Length - 1)
-                {
-                    parentNode.ParentHash = Array.Empty<byte>();
-                }
-                else
-                {
-                    uint parentAbove = senderDirectPath[i + 1];
-                    uint leftChild = TreeMath.Left(parentAbove);
-                    uint rightChild = TreeMath.Right(parentAbove);
-                    uint siblingOfParent = (nodeIdx == leftChild) ? rightChild : leftChild;
-                    byte[] siblingTreeHash = tentativeTree.ComputeTreeHash(_cs, siblingOfParent);
-                    parentNode.ParentHash = tentativeTree.ComputeParentHash(_cs, parentAbove, siblingTreeHash);
-                }
-                tentativeTree.SetParent(nodeIdx, parentNode);
+            // Find our decryption position in the filtered copath
+            // Build private key map from our leaf + known parent node keys
+            var myPrivateKeys = new Dictionary<uint, byte[]>();
+            uint myNodeIdx = TreeMath.LeafToNode(_myLeafIndex);
+            myPrivateKeys[myNodeIdx] = _myHpkePrivateKey;
+            var myDp = TreeMath.DirectPath(_myLeafIndex, _tree.LeafCount);
+            foreach (uint dpNode in myDp)
+            {
+                var pn = _tree.GetParent(dpNode);
+                if (pn?.PrivateKey != null)
+                    myPrivateKeys[dpNode] = pn.PrivateKey;
             }
+
+            int copathPos = -1;
+            int resPos = -1;
+            uint resNodeIdx = uint.MaxValue;
+            for (int i = 0; i < filteredCopath.Count; i++)
+            {
+                var resolution = originalTree.Resolution(filteredCopath[i]);
+                var encResolution = resolution.Where(n => !addedNodeIndices.Contains(n)).ToList();
+                for (int j = 0; j < encResolution.Count; j++)
+                {
+                    if (myPrivateKeys.ContainsKey(encResolution[j]))
+                    {
+                        copathPos = i;
+                        resPos = j;
+                        resNodeIdx = encResolution[j];
+                        break;
+                    }
+                }
+                if (copathPos >= 0) break;
+            }
+
+            if (copathPos < 0)
+                throw new InvalidOperationException(
+                    $"Cannot find decryptable path secret for leaf {_myLeafIndex} from sender {senderLeaf}.");
+
+            // Decrypt path secret using EncryptWithLabel format
+            var ct = commit.Path.Nodes[copathPos].EncryptedPathSecret[resPos];
+            byte[] myPrivKey = myPrivateKeys[resNodeIdx];
+            byte[] pathSecret = _cs.HpkeOpen(myPrivKey, ct.KemOutput,
+                provisionalEncryptInfo, Array.Empty<byte>(), ct.Ciphertext);
+
+            // Derive forward: compute private keys for all filtered DP nodes from copathPos onward
+            byte[] currentPathSecret = pathSecret;
+            for (int i = copathPos; i < filteredDp.Count; i++)
+            {
+                byte[] nodeSecret = _cs.DeriveSecret(currentPathSecret, "node");
+                var (nodePriv, _) = TreeKem.DeriveKeyPair(_cs, nodeSecret);
+                var pn = tentativeTree.GetParent(filteredDp[i]);
+                if (pn != null)
+                    pn.PrivateKey = nodePriv;
+
+                if (i < filteredDp.Count - 1)
+                    currentPathSecret = _cs.DeriveSecret(currentPathSecret, "path");
+            }
+            commitSecret = _cs.DeriveSecret(currentPathSecret, "path");
         }
         else
         {
-            commitSecret = new byte[_cs.SecretSize]; // No path = zero commit secret
+            // No UpdatePath: commit_secret = zeros
+            commitSecret = new byte[_cs.SecretSize];
+
+            // RFC 9420 §7.7: When there's no UpdatePath, add each newly added leaf
+            // to unmerged_leaves of ALL non-blank parent nodes on its direct path.
+            foreach (uint addedLeaf in addedLeaves)
+            {
+                var addedDp = TreeMath.DirectPath(addedLeaf, tentativeTree.LeafCount);
+                foreach (uint dpNode in addedDp)
+                {
+                    var pn = tentativeTree.GetParent(dpNode);
+                    if (pn != null)
+                        pn.UnmergedLeaves.Add(addedLeaf);
+                }
+            }
         }
 
         // Compute new epoch state
-        var root = TreeMath.Root(tentativeTree.LeafCount);
-        byte[] treeHash = tentativeTree.ComputeTreeHash(_cs, root);
+        var root2 = TreeMath.Root(tentativeTree.LeafCount);
+        byte[] treeHash = tentativeTree.ComputeTreeHash(_cs, root2);
 
+        // Build ConfirmedTranscriptHashInput per RFC 9420 §8.2
+        byte[] confirmedInput = MessageFraming.BuildConfirmedTranscriptHashInput(
+            wireFormat, content, auth.Signature);
         byte[] newConfirmedTranscriptHash = _cs.Hash(
-            Concat(_transcriptHash.InterimTranscriptHash, tbs));
+            Concat(_transcriptHash.InterimTranscriptHash, confirmedInput));
 
         var newGroupContext = new GroupContext
         {
@@ -636,8 +918,26 @@ public sealed class MlsGroup
         };
         byte[] newContextBytes = SerializeGroupContext(newGroupContext);
 
+        // Compute PSK secret if needed
+        byte[]? pskSecret = null;
+        if (pskIds.Count > 0)
+        {
+            var pskInputs = pskIds.Select(id =>
+            {
+                byte[] pskValue = Array.Empty<byte>();
+                if (id.PskType == PskType.Resumption &&
+                    _resumptionPsks.TryGetValue(id.ResumptionEpoch, out var rPsk))
+                    pskValue = rPsk;
+                else if (id.PskType == PskType.External &&
+                         _externalPsks.TryGetValue(Convert.ToHexString(id.PskId).ToLowerInvariant(), out var ePsk))
+                    pskValue = ePsk;
+                return new PskSecretDerivation.PskInput { Id = id, PskValue = pskValue };
+            }).ToArray();
+            pskSecret = PskSecretDerivation.ComputePskSecret(_cs, pskInputs);
+        }
+
         var newKeySchedule = KeyScheduleEpoch.Create(
-            _cs, _keySchedule.InitSecret, commitSecret, newContextBytes);
+            _cs, _keySchedule.InitSecret, commitSecret, newContextBytes, pskSecret);
 
         // Verify confirmation tag
         byte[] expectedTag = newKeySchedule.ComputeConfirmationTag(
@@ -646,19 +946,21 @@ public sealed class MlsGroup
             !CryptographicOperations.FixedTimeEquals(expectedTag, auth.ConfirmationTag))
             throw new InvalidOperationException("Invalid confirmation tag.");
 
-        byte[] newInterimTranscriptHash = _cs.Hash(
-            Concat(newConfirmedTranscriptHash, auth.ConfirmationTag));
+        // Update transcript hash
+        var newTranscriptHash = _transcriptHash.Clone();
+        newTranscriptHash.Update(_cs, confirmedInput, auth.ConfirmationTag);
 
         // Apply the new state
         _tree = tentativeTree;
         _epoch = _epoch + 1;
         _groupContext = newGroupContext;
         _keySchedule = newKeySchedule;
-        _transcriptHash = new TranscriptHash(
-            newConfirmedTranscriptHash, newInterimTranscriptHash);
+        _transcriptHash = newTranscriptHash;
         _secretTree = new SecretTree(
             _cs, _keySchedule.EncryptionSecret, _tree.LeafCount);
         _extensions = tentativeExtensions;
+        _resumptionPsks[_epoch] = newKeySchedule.ResumptionPsk;
+        _proposalCache.Clear();
     }
 
     // -- Process Welcome (join a group) --
@@ -675,6 +977,8 @@ public sealed class MlsGroup
     /// <param name="myHpkePrivateKey">The leaf HPKE private key from CreateKeyPackage.</param>
     /// <param name="mySigningPrivateKey">The member's private signing key.</param>
     /// <param name="config">Group configuration, or null for defaults.</param>
+    /// <param name="externalTree">Optional ratchet tree bytes if not in GroupInfo extensions.</param>
+    /// <param name="externalPsks">Optional map of PSK ID hex → PSK value for external PSKs.</param>
     /// <returns>An MlsGroup representing the joined group state.</returns>
     public static MlsGroup ProcessWelcome(
         ICipherSuite cs,
@@ -683,7 +987,9 @@ public sealed class MlsGroup
         byte[] myInitPrivateKey,
         byte[] myHpkePrivateKey,
         byte[] mySigningPrivateKey,
-        MlsGroupConfig? config = null)
+        MlsGroupConfig? config = null,
+        byte[]? externalTree = null,
+        Dictionary<string, byte[]>? externalPsks = null)
     {
         config ??= MlsGroupConfig.Default;
 
@@ -719,7 +1025,27 @@ public sealed class MlsGroup
         var groupSecrets = GroupSecrets.ReadFrom(gsReader);
 
         // Derive welcome_secret via intermediate_secret per RFC 9420 §8
-        byte[] pskSecret = new byte[cs.SecretSize]; // zeros(Nh) when no PSKs
+        // Compute PSK secret from GroupSecrets.psks and external PSKs
+        byte[] pskSecret;
+        if (groupSecrets.Psks.Length > 0)
+        {
+            var pskInputs = groupSecrets.Psks.Select(id =>
+            {
+                byte[] pskValue = Array.Empty<byte>();
+                if (id.PskType == PskType.External && externalPsks != null)
+                {
+                    string pskIdHex = Convert.ToHexString(id.PskId).ToLowerInvariant();
+                    if (externalPsks.TryGetValue(pskIdHex, out var ePsk))
+                        pskValue = ePsk;
+                }
+                return new PskSecretDerivation.PskInput { Id = id, PskValue = pskValue };
+            }).ToArray();
+            pskSecret = PskSecretDerivation.ComputePskSecret(cs, pskInputs);
+        }
+        else
+        {
+            pskSecret = new byte[cs.SecretSize]; // zeros(Nh) when no PSKs
+        }
         byte[] intermediateSecret = cs.Extract(groupSecrets.JoinerSecret, pskSecret);
         byte[] welcomeSecret = cs.DeriveSecret(intermediateSecret, "welcome");
         byte[] welcomeKey = cs.ExpandWithLabel(
@@ -734,27 +1060,34 @@ public sealed class MlsGroup
         var giReader = new TlsReader(groupInfoBytes);
         var groupInfo = GroupInfo.ReadFrom(giReader);
 
-        // Extract the ratchet tree from the GroupInfo extensions
+        // Extract the ratchet tree from the GroupInfo extensions or external source
         RatchetTree tree;
-        byte[]? ratchetTreeData = null;
-        foreach (var ext in groupInfo.Extensions)
+        if (externalTree != null)
         {
-            if (ext.ExtensionType == 0x0002) // ratchet_tree
-            {
-                ratchetTreeData = ext.ExtensionData;
-                break;
-            }
-        }
-
-        if (ratchetTreeData != null)
-        {
-            var treeReader = new TlsReader(ratchetTreeData);
-            tree = RatchetTree.ReadFrom(treeReader);
+            tree = RatchetTree.ReadFrom(new TlsReader(externalTree));
         }
         else
         {
-            throw new InvalidOperationException(
-                "Welcome GroupInfo does not contain ratchet_tree extension.");
+            byte[]? ratchetTreeData = null;
+            foreach (var ext in groupInfo.Extensions)
+            {
+                if (ext.ExtensionType == 0x0002) // ratchet_tree
+                {
+                    ratchetTreeData = ext.ExtensionData;
+                    break;
+                }
+            }
+
+            if (ratchetTreeData != null)
+            {
+                var treeReader = new TlsReader(ratchetTreeData);
+                tree = RatchetTree.ReadFrom(treeReader);
+            }
+            else
+            {
+                throw new InvalidOperationException(
+                    "Welcome GroupInfo does not contain ratchet_tree extension and no external tree provided.");
+            }
         }
 
         // Find our leaf index by matching signature key
@@ -778,7 +1111,7 @@ public sealed class MlsGroup
         var groupContext = groupInfo.GroupContext;
         byte[] serializedContext = SerializeGroupContext(groupContext);
         var keySchedule = KeyScheduleEpoch.FromJoinerSecret(
-            cs, groupSecrets.JoinerSecret, serializedContext);
+            cs, groupSecrets.JoinerSecret, serializedContext, pskSecret);
 
         // Verify confirmation tag
         byte[] expectedTag = keySchedule.ComputeConfirmationTag(
@@ -786,9 +1119,50 @@ public sealed class MlsGroup
         if (!CryptographicOperations.FixedTimeEquals(expectedTag, groupInfo.ConfirmationTag))
             throw new InvalidOperationException("Invalid confirmation tag in GroupInfo.");
 
-        // Compute interim transcript hash from confirmed + confirmation_tag
+        // Compute interim transcript hash: Hash(confirmed || InterimTranscriptHashInput)
+        // InterimTranscriptHashInput = struct { MAC confirmation_tag; } where MAC = opaque<V>
+        byte[] interimInput = TlsCodec.Serialize(w => w.WriteOpaqueV(groupInfo.ConfirmationTag));
         byte[] interimHash = cs.Hash(
-            Concat(groupContext.ConfirmedTranscriptHash, groupInfo.ConfirmationTag));
+            Concat(groupContext.ConfirmedTranscriptHash, interimInput));
+
+        // Derive parent node private keys from path_secret if provided
+        // RFC 9420 §12.4.3.1: path_secret is at the common ancestor of committer and joiner
+        var privateKeys = new Dictionary<uint, byte[]>();
+        uint myNodeIdx = TreeMath.LeafToNode(myLeafIndex);
+        privateKeys[myNodeIdx] = myHpkePrivateKey;
+
+        if (groupSecrets.PathSecret != null)
+        {
+            uint committerLeaf = groupInfo.Signer;
+            var myDp = TreeMath.DirectPath(myLeafIndex, tree.LeafCount);
+            uint commonAncestor = TreeMath.CommonAncestor(committerLeaf, myLeafIndex);
+
+            int startIdx = -1;
+            for (int i = 0; i < myDp.Length; i++)
+            {
+                if (myDp[i] == commonAncestor)
+                {
+                    startIdx = i;
+                    break;
+                }
+            }
+
+            if (startIdx >= 0)
+            {
+                byte[] pathSecret = groupSecrets.PathSecret;
+                for (int i = startIdx; i < myDp.Length; i++)
+                {
+                    byte[] nodeSecret = cs.DeriveSecret(pathSecret, "node");
+                    var (nodePriv, _) = TreeKem.DeriveKeyPair(cs, nodeSecret);
+                    privateKeys[myDp[i]] = nodePriv;
+                    var parentNode = tree.GetParent(myDp[i]);
+                    if (parentNode != null)
+                        parentNode.PrivateKey = nodePriv;
+                    if (i < myDp.Length - 1)
+                        pathSecret = cs.DeriveSecret(pathSecret, "path");
+                }
+            }
+        }
 
         // Build the group object
         var group = new MlsGroup(cs, config);
@@ -805,6 +1179,23 @@ public sealed class MlsGroup
         group._secretTree = new SecretTree(
             cs, keySchedule.EncryptionSecret, tree.LeafCount);
         group._extensions = groupContext.Extensions;
+        group._resumptionPsks[groupContext.Epoch] = keySchedule.ResumptionPsk;
+        if (externalPsks != null)
+        {
+            foreach (var kvp in externalPsks)
+                group._externalPsks[kvp.Key] = kvp.Value;
+        }
+
+        // Store private keys in the group for Decap during commit processing
+        foreach (var (nodeIdx, privKey) in privateKeys)
+        {
+            if (nodeIdx != myNodeIdx)
+            {
+                var parentNode = tree.GetParent(nodeIdx);
+                if (parentNode != null)
+                    parentNode.PrivateKey = privKey;
+            }
+        }
 
         return group;
     }
@@ -990,7 +1381,8 @@ public sealed class MlsGroup
     // ---- Helper: Apply a single proposal to the tree ----
 
     private static void ApplyProposal(
-        RatchetTree tree, Proposal proposal, ref Extension[] extensions)
+        RatchetTree tree, Proposal proposal, ref Extension[] extensions,
+        uint senderLeaf = uint.MaxValue)
     {
         if (proposal is AddProposal add)
         {
@@ -1002,15 +1394,22 @@ public sealed class MlsGroup
         }
         else if (proposal is UpdateProposal update)
         {
-            // Find leaf with matching signature key and update it
-            for (uint i = 0; i < tree.LeafCount; i++)
+            // If sender is known, use it directly; otherwise match by signature key
+            if (senderLeaf != uint.MaxValue)
             {
-                var leaf = tree.GetLeaf(i);
-                if (leaf != null &&
-                    leaf.SignatureKey.AsSpan().SequenceEqual(update.LeafNode.SignatureKey))
+                tree.SetLeaf(senderLeaf, update.LeafNode);
+            }
+            else
+            {
+                for (uint i = 0; i < tree.LeafCount; i++)
                 {
-                    tree.SetLeaf(i, update.LeafNode);
-                    break;
+                    var leaf = tree.GetLeaf(i);
+                    if (leaf != null &&
+                        leaf.SignatureKey.AsSpan().SequenceEqual(update.LeafNode.SignatureKey))
+                    {
+                        tree.SetLeaf(i, update.LeafNode);
+                        break;
+                    }
                 }
             }
         }

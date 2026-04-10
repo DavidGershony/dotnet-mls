@@ -3,6 +3,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using DotnetMls.Codec;
 using DotnetMls.Crypto;
+using DotnetMls.Group;
 using DotnetMls.KeySchedule;
 using DotnetMls.Message;
 using DotnetMls.Tree;
@@ -637,20 +638,28 @@ public class Rfc9420TestVectorTests
         int tagPrefixLen = 1; // VarInt(32) = 0x20 = 1 byte
         int tagLen = cs.HashSize; // MAC output size = 32 for SHA-256
         byte[] confirmedInput = authenticatedContent[..(authenticatedContent.Length - tagPrefixLen - tagLen)];
+        byte[] confirmationTagFromVector = authenticatedContent[(authenticatedContent.Length - tagLen)..];
 
-        // confirmed_transcript_hash = Hash(interim_before || ConfirmedTranscriptHashInput)
-        byte[] computedConfirmedHash = cs.Hash(Concat(interimBefore, confirmedInput));
-        Assert.Equal(expectedConfirmedHash, computedConfirmedHash);
+        // Use the production TranscriptHash class
+        var transcriptHash = new TranscriptHash(interimBefore, interimBefore);
 
-        // confirmation_tag = MAC(confirmation_key, confirmed_transcript_hash)
-        byte[] confirmationTag = cs.Mac(confirmationKey, computedConfirmedHash);
+        // Compute confirmation_tag to pass to Update
+        // (The test vector provides confirmation_key, so we derive the tag from the expected confirmed hash)
+        // However, Update needs the tag AFTER computing confirmed hash, so we verify step by step.
 
-        // interim_transcript_hash_after = Hash(confirmed_transcript_hash || InterimTranscriptHashInput)
-        // InterimTranscriptHashInput = struct { MAC confirmation_tag; }
-        // MAC is opaque<V>, so serialized with VarInt length prefix
-        byte[] interimInput = TlsCodec.Serialize(w => w.WriteOpaqueV(confirmationTag));
-        byte[] computedInterimAfter = cs.Hash(Concat(computedConfirmedHash, interimInput));
-        Assert.Equal(expectedInterimAfter, computedInterimAfter);
+        // Step 1: Verify confirmed hash via production code
+        // TranscriptHash.Update computes both, so we need the correct confirmation_tag.
+        // From the vector: confirmation_tag = MAC(confirmation_key, confirmed_transcript_hash)
+        // But we can't call Update without the tag... Use direct verification instead:
+        // Actually, the test vector gives us the authenticated_content which contains the tag.
+        // Let's extract it and use Update.
+        byte[] confirmationTag = cs.Mac(confirmationKey, expectedConfirmedHash);
+
+        // Verify Update produces correct results
+        transcriptHash.Update(cs, confirmedInput, confirmationTag);
+
+        Assert.Equal(expectedConfirmedHash, transcriptHash.ConfirmedTranscriptHash);
+        Assert.Equal(expectedInterimAfter, transcriptHash.InterimTranscriptHash);
     }
 
     private static byte[] Concat(byte[] a, byte[] b)
@@ -1949,28 +1958,9 @@ public class Rfc9420TestVectorTests
     }
 
     /// <summary>
-    /// Holds the passive client's state between epochs.
+    /// Processes a Welcome message using production MlsGroup.ProcessWelcome.
     /// </summary>
-    private sealed class PassiveClientState
-    {
-        public required Tree.RatchetTree Tree { get; set; }
-        public required uint MyLeafIndex { get; set; }
-        public required byte[] MyEncryptionPriv { get; set; }
-        public required KeySchedule.KeyScheduleEpoch KeySchedule { get; set; }
-        public required GroupContext GroupContext { get; set; }
-        public required byte[] InterimTranscriptHash { get; set; }
-        public required Extension[] Extensions { get; set; }
-        public required ulong Epoch { get; set; }
-        // Map from node index to HPKE private key (leaf + parent nodes)
-        public Dictionary<uint, byte[]> PrivateKeys { get; set; } = new();
-        // Map from epoch number to resumption_psk for that epoch
-        public Dictionary<ulong, byte[]> ResumptionPsks { get; set; } = new();
-    }
-
-    /// <summary>
-    /// Processes a Welcome message manually (not using MlsGroup) to establish passive client state.
-    /// </summary>
-    private PassiveClientState ProcessWelcomeForPassiveClient(
+    private MlsGroup ProcessWelcomeForPassiveClient(
         PassiveClientVector v, ICipherSuite cs)
     {
         // Parse MLSMessage-wrapped KeyPackage
@@ -1981,109 +1971,6 @@ public class Rfc9420TestVectorTests
         var welcomeMsg = MlsMessage.ReadFrom(new TlsReader(Hex(v.Welcome)));
         var welcome = (Welcome)welcomeMsg.Body;
 
-        // Find matching EncryptedGroupSecrets
-        byte[] kpBytes = TlsCodec.Serialize(w => keyPackage.WriteTo(w));
-        var kpRef = KeyPackageRef.Compute(cs, kpBytes);
-        EncryptedGroupSecrets? mySecrets = null;
-        foreach (var egs in welcome.Secrets)
-        {
-            if (egs.NewMember.AsSpan().SequenceEqual(kpRef.Value))
-            {
-                mySecrets = egs;
-                break;
-            }
-        }
-        Assert.NotNull(mySecrets);
-
-        // HPKE decrypt GroupSecrets (EncryptWithLabel per RFC 9420 §5.1.3)
-        byte[] hpkeInfo = TlsCodec.Serialize(w =>
-        {
-            w.WriteOpaqueV(System.Text.Encoding.ASCII.GetBytes("MLS 1.0 Welcome"));
-            w.WriteOpaqueV(welcome.EncryptedGroupInfo);
-        });
-        byte[] gsBytes = cs.HpkeOpen(
-            Hex(v.InitPriv),
-            mySecrets.EncryptedGroupSecretsValue.KemOutput,
-            hpkeInfo,
-            Array.Empty<byte>(),
-            mySecrets.EncryptedGroupSecretsValue.Ciphertext);
-        var groupSecrets = GroupSecrets.ReadFrom(new TlsReader(gsBytes));
-
-        // Compute PSK secret
-        byte[] pskSecret;
-        if (v.ExternalPsks.Length > 0)
-        {
-            var pskInputs = new List<PskSecretDerivation.PskInput>();
-            foreach (var psk in groupSecrets.Psks)
-            {
-                byte[] pskValue = Array.Empty<byte>();
-                if (psk.PskType == PskType.External)
-                {
-                    // Match by psk_id
-                    foreach (var extPsk in v.ExternalPsks)
-                    {
-                        if (Hex(extPsk.PskId).AsSpan().SequenceEqual(psk.PskId))
-                        {
-                            pskValue = Hex(extPsk.Psk);
-                            break;
-                        }
-                    }
-                }
-                pskInputs.Add(new PskSecretDerivation.PskInput { Id = psk, PskValue = pskValue });
-            }
-            pskSecret = PskSecretDerivation.ComputePskSecret(cs, pskInputs.ToArray());
-        }
-        else
-        {
-            pskSecret = new byte[cs.SecretSize];
-        }
-
-        // Derive welcome_secret and decrypt GroupInfo
-        byte[] intermediateSecret = cs.Extract(groupSecrets.JoinerSecret, pskSecret);
-        byte[] welcomeSecret = cs.DeriveSecret(intermediateSecret, "welcome");
-        byte[] welcomeKey = cs.ExpandWithLabel(
-            welcomeSecret, "key", Array.Empty<byte>(), cs.AeadKeySize);
-        byte[] welcomeNonce = cs.ExpandWithLabel(
-            welcomeSecret, "nonce", Array.Empty<byte>(), cs.AeadNonceSize);
-        byte[] groupInfoBytes = cs.AeadDecrypt(
-            welcomeKey, welcomeNonce, Array.Empty<byte>(), welcome.EncryptedGroupInfo);
-        var groupInfo = GroupInfo.ReadFrom(new TlsReader(groupInfoBytes));
-
-        // Get ratchet tree (from GroupInfo extensions or test vector)
-        Tree.RatchetTree tree;
-        if (v.RatchetTree != null)
-        {
-            tree = Tree.RatchetTree.ReadFrom(new TlsReader(Hex(v.RatchetTree)));
-        }
-        else
-        {
-            byte[]? treeData = null;
-            foreach (var ext in groupInfo.Extensions)
-            {
-                if (ext.ExtensionType == 0x0002)
-                {
-                    treeData = ext.ExtensionData;
-                    break;
-                }
-            }
-            Assert.NotNull(treeData);
-            tree = Tree.RatchetTree.ReadFrom(new TlsReader(treeData!));
-        }
-
-        // Find our leaf index
-        uint myLeafIndex = uint.MaxValue;
-        for (uint i = 0; i < tree.LeafCount; i++)
-        {
-            var leaf = tree.GetLeaf(i);
-            if (leaf != null &&
-                leaf.SignatureKey.AsSpan().SequenceEqual(keyPackage.LeafNode.SignatureKey))
-            {
-                myLeafIndex = i;
-                break;
-            }
-        }
-        Assert.NotEqual(uint.MaxValue, myLeafIndex);
-
         // Verify signature_priv matches the KeyPackage's public SignatureKey
         var sigPrivParams = new Org.BouncyCastle.Crypto.Parameters.Ed25519PrivateKeyParameters(
             Hex(v.SignaturePriv), 0);
@@ -2091,527 +1978,50 @@ public class Rfc9420TestVectorTests
         sigPrivParams.GeneratePublicKey().Encode(derivedSigPub, 0);
         Assert.Equal(keyPackage.LeafNode.SignatureKey, derivedSigPub);
 
-        // Derive key schedule from joiner_secret
-        var groupContext = groupInfo.GroupContext;
-        byte[] contextBytes = TlsCodec.Serialize(w => groupContext.WriteTo(w));
-        var keySchedule = KeyScheduleEpoch.FromJoinerSecret(
-            cs, groupSecrets.JoinerSecret, contextBytes, pskSecret);
-
-        // Verify confirmation tag
-        byte[] expectedTag = keySchedule.ComputeConfirmationTag(
-            cs, groupContext.ConfirmedTranscriptHash);
-        Assert.True(
-            CryptographicOperations.FixedTimeEquals(expectedTag, groupInfo.ConfirmationTag),
-            "Confirmation tag mismatch in Welcome");
-
-        // Compute interim transcript hash per RFC 9420 §8.2:
-        // InterimTranscriptHashInput = { MAC confirmation_tag } where MAC = opaque<V>
-        byte[] interimInput = TlsCodec.Serialize(w => w.WriteOpaqueV(groupInfo.ConfirmationTag));
-        byte[] interimHash = cs.Hash(
-            Concat(groupContext.ConfirmedTranscriptHash, interimInput));
-
-        // Build private key map
-        var privateKeys = new Dictionary<uint, byte[]>();
-        uint myNodeIdx = TreeMath.LeafToNode(myLeafIndex);
-        privateKeys[myNodeIdx] = Hex(v.EncryptionPriv);
-
-        // Derive parent node private keys from path_secret (if provided in GroupSecrets)
-        // RFC 9420 §12.4.3.1: path_secret is at the common ancestor of the
-        // committer and the joiner. Derive forward up the joiner's direct path.
-        if (groupSecrets.PathSecret != null)
+        // Build external PSK map if needed
+        Dictionary<string, byte[]>? externalPsks = null;
+        if (v.ExternalPsks.Length > 0)
         {
-            uint committerLeaf = groupInfo.Signer;
-            var myDp = TreeMath.DirectPath(myLeafIndex, tree.LeafCount);
-
-            // Find the common ancestor node of committer and joiner
-            // CommonAncestor takes LEAF indices (it calls LeafToNode internally)
-            uint commonAncestor = TreeMath.CommonAncestor(committerLeaf, myLeafIndex);
-
-            // Find the position of the common ancestor in the joiner's direct path
-            int startIdx = -1;
-            for (int i = 0; i < myDp.Length; i++)
-            {
-                if (myDp[i] == commonAncestor)
-                {
-                    startIdx = i;
-                    break;
-                }
-            }
-            Assert.True(startIdx >= 0, "Common ancestor not found in joiner's direct path");
-
-            byte[] pathSecret = groupSecrets.PathSecret;
-            for (int i = startIdx; i < myDp.Length; i++)
-            {
-                byte[] nodeSecret = cs.DeriveSecret(pathSecret, "node");
-                byte[] nodePriv = TreeKem.DeriveKeyPair(cs, nodeSecret).privateKey;
-                privateKeys[myDp[i]] = nodePriv;
-                // Store private key in tree node if it exists
-                var parentNode = tree.GetParent(myDp[i]);
-                if (parentNode != null)
-                    parentNode.PrivateKey = nodePriv;
-                if (i < myDp.Length - 1)
-                    pathSecret = cs.DeriveSecret(pathSecret, "path");
-            }
+            externalPsks = new Dictionary<string, byte[]>();
+            foreach (var psk in v.ExternalPsks)
+                externalPsks[psk.PskId.ToLowerInvariant()] = Hex(psk.Psk);
         }
 
-        var resumptionPsks = new Dictionary<ulong, byte[]>
-        {
-            [groupContext.Epoch] = keySchedule.ResumptionPsk,
-        };
-
-        return new PassiveClientState
-        {
-            Tree = tree,
-            MyLeafIndex = myLeafIndex,
-            MyEncryptionPriv = Hex(v.EncryptionPriv),
-            KeySchedule = keySchedule,
-            GroupContext = groupContext,
-            InterimTranscriptHash = interimHash,
-            Extensions = groupContext.Extensions,
-            Epoch = groupContext.Epoch,
-            PrivateKeys = privateKeys,
-            ResumptionPsks = resumptionPsks,
-        };
+        // Use production code
+        return MlsGroup.ProcessWelcome(
+            cs,
+            welcome,
+            keyPackage,
+            Hex(v.InitPriv),
+            Hex(v.EncryptionPriv),
+            Hex(v.SignaturePriv),
+            externalTree: v.RatchetTree != null ? Hex(v.RatchetTree) : null,
+            externalPsks: externalPsks);
     }
 
     /// <summary>
-    /// Processes a single epoch (proposals + commit) for a passive client.
+    /// Processes a single epoch using production MlsGroup.CacheProposal + ProcessCommit.
     /// </summary>
     private void ProcessEpochForPassiveClient(
-        PassiveClientState state, PassiveClientEpoch epoch,
+        MlsGroup group, PassiveClientEpoch epoch,
         PassiveClientVector v, ICipherSuite cs)
     {
-        // Parse standalone proposals and build proposal cache (proposal + sender leaf index)
-        var proposalCache = new Dictionary<string, (Proposal Proposal, uint SenderLeaf)>();
+        // Cache standalone proposals via production code
         foreach (var propHex in epoch.Proposals)
         {
             var propMsg = MlsMessage.ReadFrom(new TlsReader(Hex(propHex)));
             var propPub = (PublicMessage)propMsg.Body;
-
-            // Compute ProposalRef = RefHash("MLS 1.0 Proposal Reference", AuthenticatedContent)
-            byte[] authContent = TlsCodec.Serialize(w =>
-            {
-                w.WriteUint16((ushort)WireFormat.MlsPublicMessage);
-                propPub.Content.WriteTo(w);
-                propPub.Auth.WriteTo(w, propPub.Content.ContentType);
-            });
-            byte[] propRef = cs.RefHash("MLS 1.0 Proposal Reference", authContent);
-            var proposal = Proposal.ReadFrom(new TlsReader(propPub.Content.Content));
-            proposalCache[Convert.ToHexString(propRef).ToLowerInvariant()] =
-                (proposal, propPub.Content.Sender.LeafIndex);
+            group.CacheProposal(propPub);
         }
 
         // Parse commit PublicMessage
         var commitMsg = MlsMessage.ReadFrom(new TlsReader(Hex(epoch.Commit)));
         var commitPub = (PublicMessage)commitMsg.Body;
-        var content = commitPub.Content;
-        Assert.Equal(ContentType.Commit, content.ContentType);
 
-        uint senderLeaf = content.Sender.LeafIndex;
-
-        // Verify signature using the CURRENT group context
-        byte[] currentCtxBytes = TlsCodec.Serialize(w => state.GroupContext.WriteTo(w));
-        byte[] senderSigKey = state.Tree.GetLeaf(senderLeaf)!.SignatureKey;
-        byte[] tbs = MessageFraming.BuildFramedContentTbs(
-            WireFormat.MlsPublicMessage, content, currentCtxBytes);
-        Assert.True(
-            cs.VerifyWithLabel(senderSigKey, "FramedContentTBS", tbs, commitPub.Auth.Signature),
-            $"Commit signature verification failed for sender {senderLeaf}");
-
-        // Parse the Commit struct
-        var commit = Types.Commit.ReadFrom(new TlsReader(content.Content));
-
-        // Clone tree and extensions
-        var tentativeTree = state.Tree.Clone();
-        var tentativeExtensions = (Extension[])state.Extensions.Clone();
-
-        // RFC 9420 §12.4: Proposals are applied in type order, not commit order.
-        // Order: GroupContextExtensions → Update → Remove (desc leaf index) → Add.
-        // PSK proposals are collected in commit order for key schedule but don't modify the tree.
-        var pskIds = new List<PreSharedKeyId>();
-        var addedLeaves = new List<uint>();
-
-        // First pass: resolve all proposals and collect by type
-        var updates = new List<(UpdateProposal Prop, uint SenderLeaf)>();
-        var removes = new List<RemoveProposal>();
-        var adds = new List<AddProposal>();
-        var gces = new List<GroupContextExtensionsProposal>();
-
-        foreach (var por in commit.Proposals)
-        {
-            Proposal proposal;
-            uint proposerLeaf = senderLeaf; // default for inline proposals
-            if (por is InlineProposal inline)
-            {
-                proposal = inline.Proposal;
-            }
-            else if (por is ProposalReference pref)
-            {
-                string refKey = Convert.ToHexString(pref.Reference).ToLowerInvariant();
-                Assert.True(proposalCache.ContainsKey(refKey),
-                    $"Unknown proposal reference: {refKey}");
-                var cached = proposalCache[refKey];
-                proposal = cached.Proposal;
-                proposerLeaf = cached.SenderLeaf;
-            }
-            else
-            {
-                throw new InvalidOperationException("Unknown ProposalOrRef type");
-            }
-
-            if (proposal is AddProposal add)
-                adds.Add(add);
-            else if (proposal is RemoveProposal remove)
-                removes.Add(remove);
-            else if (proposal is UpdateProposal update)
-                updates.Add((update, proposerLeaf));
-            else if (proposal is PreSharedKeyProposal pskProp)
-                pskIds.Add(pskProp.Psk);
-            else if (proposal is GroupContextExtensionsProposal gce)
-                gces.Add(gce);
-        }
-
-        // Apply in type order: GCE → Update → Remove → Add
-        foreach (var gce in gces)
-        {
-            tentativeExtensions = gce.Extensions;
-
-        }
-
-        foreach (var (update, propLeaf) in updates)
-        {
-            tentativeTree.SetLeaf(propLeaf, update.LeafNode);
-            var updateDp = TreeMath.DirectPath(propLeaf, tentativeTree.LeafCount);
-            foreach (uint dpNode in updateDp)
-                tentativeTree.SetParent(dpNode, null);
-
-        }
-
-        foreach (var remove in removes.OrderByDescending(r => r.LeafIndex))
-        {
-            for (int ni = 1; ni < tentativeTree.NodeCount; ni += 2)
-            {
-                var pn = tentativeTree.GetParent((uint)ni);
-                if (pn != null)
-                    pn.UnmergedLeaves.Remove(remove.LeafIndex);
-            }
-            uint removeNodeIdx = TreeMath.LeafToNode(remove.LeafIndex);
-            tentativeTree.SetNode(removeNodeIdx, new TreeNode.Leaf(null));
-            var removeDp = TreeMath.DirectPath(remove.LeafIndex, tentativeTree.LeafCount);
-            foreach (uint dpNode in removeDp)
-                tentativeTree.SetParent(dpNode, null);
-
-        }
-
-        // RFC 9420 §7.7.1: Truncate the tree after all removes
-        // Remove trailing blank leaf+parent pairs so tree size matches sender's view
-        if (removes.Count > 0)
-        {
-            tentativeTree.TrimTree();
-        }
-
-        foreach (var add in adds)
-        {
-            uint newLeafIdx = tentativeTree.AddLeaf(add.KeyPackage.LeafNode);
-            addedLeaves.Add(newLeafIdx);
-        }
-
-        // Process UpdatePath if present
-        byte[] commitSecret;
-        if (commit.Path != null)
-        {
-            // Save tree state AFTER proposals but BEFORE UpdatePath
-            // for sibling tree hash and resolution computation
-            var originalTree = tentativeTree.Clone();
-
-            // Apply UpdatePath public state
-            tentativeTree.SetLeaf(senderLeaf, commit.Path.LeafNode);
-            var senderDp = TreeMath.DirectPath(senderLeaf, tentativeTree.LeafCount);
-            var senderCopath = TreeMath.Copath(senderLeaf, tentativeTree.LeafCount);
-            foreach (uint n in senderDp)
-                tentativeTree.SetParent(n, null);
-
-            // RFC 9420 §7.6: Filtered direct path excludes entries whose copath
-            // child has empty resolution. The resolution for this check excludes
-            // newly added members (they won't be encrypted to in this commit).
-            var addedNodeIndices = new HashSet<uint>(addedLeaves.Select(l => TreeMath.LeafToNode(l)));
-            var filteredDp = new List<uint>();
-            var filteredCopath = new List<uint>();
-            for (int i = 0; i < senderDp.Length; i++)
-            {
-                var res = tentativeTree.Resolution(senderCopath[i]);
-                var encRes = res.Where(n => !addedNodeIndices.Contains(n)).ToList();
-                if (encRes.Count > 0)
-                {
-                    filteredDp.Add(senderDp[i]);
-                    filteredCopath.Add(senderCopath[i]);
-                }
-            }
-
-            Assert.Equal(commit.Path.Nodes.Length, filteredDp.Count);
-
-            for (int i = 0; i < filteredDp.Count; i++)
-            {
-                tentativeTree.SetParent(filteredDp[i], new ParentNode
-                {
-                    EncryptionKey = commit.Path.Nodes[i].EncryptionKey,
-                    UnmergedLeaves = new List<uint>(),
-                });
-            }
-
-            // Compute parent hashes (from root down)
-            for (int i = filteredDp.Count - 2; i >= 0; i--)
-            {
-                uint nodeIdx = filteredDp[i];
-                uint parentIdx = filteredDp[i + 1];
-                uint siblingIdx = nodeIdx < parentIdx
-                    ? TreeMath.Right(parentIdx)
-                    : TreeMath.Left(parentIdx);
-                byte[] siblingTreeHash = originalTree.ComputeTreeHash(cs, siblingIdx);
-                byte[] parentHash = tentativeTree.ComputeParentHash(cs, parentIdx, siblingTreeHash);
-                tentativeTree.GetParent(nodeIdx)!.ParentHash = parentHash;
-            }
-
-            // RFC 9420 §12.4.2 step 5: For each added member, add to unmerged_leaves
-            // of each non-blank ancestor that is NOT on the sender's filtered direct path.
-            var filteredDpSet = new HashSet<uint>(filteredDp);
-            foreach (uint addedLeaf in addedLeaves)
-            {
-                var addedDp = TreeMath.DirectPath(addedLeaf, tentativeTree.LeafCount);
-                foreach (uint dpNode in addedDp)
-                {
-                    if (!filteredDpSet.Contains(dpNode))
-                    {
-                        var pn = tentativeTree.GetParent(dpNode);
-                        if (pn != null)
-                            pn.UnmergedLeaves.Add(addedLeaf);
-                    }
-                }
-            }
-
-            // Compute provisional tree hash
-            uint root = TreeMath.Root(tentativeTree.LeafCount);
-            byte[] provisionalTreeHash = tentativeTree.ComputeTreeHash(cs, root);
-
-            // Compute confirmed transcript hash per RFC 9420 §8.2:
-            // ConfirmedTranscriptHashInput = { wire_format, FramedContent, signature }
-            // NOT FramedContentTBS (which includes version + group_context instead of signature)
-            byte[] confirmedInput = TlsCodec.Serialize(w =>
-            {
-                w.WriteUint16((ushort)WireFormat.MlsPublicMessage);
-                content.WriteTo(w);
-                w.WriteOpaqueV(commitPub.Auth.Signature);
-            });
-            byte[] newConfirmedTranscriptHash = cs.Hash(
-                Concat(state.InterimTranscriptHash, confirmedInput));
-
-            // Build new GroupContext
-            var newGroupContext = new GroupContext
-            {
-                Version = ProtocolVersion.Mls10,
-                CipherSuite = cs.Id,
-                GroupId = state.GroupContext.GroupId,
-                Epoch = state.Epoch + 1,
-                TreeHash = provisionalTreeHash,
-                ConfirmedTranscriptHash = newConfirmedTranscriptHash,
-                Extensions = tentativeExtensions,
-            };
-            byte[] newCtxBytes = TlsCodec.Serialize(w => newGroupContext.WriteTo(w));
-
-            // Find our decryption position in filtered copath
-            // (addedNodeIndices already computed above for filtered DP)
-            int copathPos = -1;
-            int resPos = -1;
-            uint resNodeIdx = uint.MaxValue;
-            for (int i = 0; i < filteredCopath.Count; i++)
-            {
-                var resolution = originalTree.Resolution(filteredCopath[i]);
-                // Filter out added leaves to get the encryption resolution
-                var encResolution = resolution.Where(n => !addedNodeIndices.Contains(n)).ToList();
-                for (int j = 0; j < encResolution.Count; j++)
-                {
-                    if (state.PrivateKeys.ContainsKey(encResolution[j]))
-                    {
-                        copathPos = i;
-                        resPos = j;
-                        resNodeIdx = encResolution[j];
-                        break;
-                    }
-                }
-                if (copathPos >= 0) break;
-            }
-
-            Assert.True(copathPos >= 0,
-                $"Passive client (leaf {state.MyLeafIndex}) not found in any filtered copath resolution for sender {senderLeaf}");
-
-            // Decrypt path secret using provisional GroupContext
-            var ct = commit.Path.Nodes[copathPos].EncryptedPathSecret[resPos];
-            byte[] myPrivKey = state.PrivateKeys[resNodeIdx];
-
-            // RFC 9420 §12.4.2: The provisional GroupContext for EncryptWithLabel uses
-            // the new epoch and new tree_hash, but the OLD confirmed_transcript_hash.
-            var provisionalGroupContext = new GroupContext
-            {
-                Version = ProtocolVersion.Mls10,
-                CipherSuite = cs.Id,
-                GroupId = state.GroupContext.GroupId,
-                Epoch = state.Epoch + 1,
-                TreeHash = provisionalTreeHash,
-                ConfirmedTranscriptHash = state.GroupContext.ConfirmedTranscriptHash,
-                Extensions = tentativeExtensions,
-            };
-            byte[] provisionalCtxBytes = TlsCodec.Serialize(w => provisionalGroupContext.WriteTo(w));
-            byte[] provisionalEncryptContext = TlsCodec.Serialize(w =>
-            {
-                w.WriteOpaqueV(System.Text.Encoding.UTF8.GetBytes("MLS 1.0 UpdatePathNode"));
-                w.WriteOpaqueV(provisionalCtxBytes);
-            });
-
-            byte[] pathSecret = cs.HpkeOpen(myPrivKey, ct.KemOutput, provisionalEncryptContext,
-                Array.Empty<byte>(), ct.Ciphertext);
-
-            // Derive forward: compute private keys for all filtered DP nodes from copathPos onward
-            byte[] currentPathSecret = pathSecret;
-            var newPrivateKeys = new Dictionary<uint, byte[]>(state.PrivateKeys);
-            for (int i = copathPos; i < filteredDp.Count; i++)
-            {
-                byte[] nodeSecret = cs.DeriveSecret(currentPathSecret, "node");
-                byte[] nodePriv = TreeKem.DeriveKeyPair(cs, nodeSecret).privateKey;
-                newPrivateKeys[filteredDp[i]] = nodePriv;
-                tentativeTree.GetParent(filteredDp[i])!.PrivateKey = nodePriv;
-
-                if (i < filteredDp.Count - 1)
-                    currentPathSecret = cs.DeriveSecret(currentPathSecret, "path");
-            }
-            commitSecret = cs.DeriveSecret(currentPathSecret, "path");
-
-            // Update private keys
-            state.PrivateKeys = newPrivateKeys;
-
-            // Compute PSK secret for key schedule
-            byte[]? pskSecretParam = ComputePskSecretFromProposals(pskIds, v, cs, state);
-
-            // Derive new key schedule
-            var newKeySchedule = KeyScheduleEpoch.Create(
-                cs, state.KeySchedule.InitSecret, commitSecret, newCtxBytes, pskSecretParam);
-
-            // Verify confirmation tag
-            byte[] expectedTag = newKeySchedule.ComputeConfirmationTag(cs, newConfirmedTranscriptHash);
-            Assert.True(
-                commitPub.Auth.ConfirmationTag != null &&
-                CryptographicOperations.FixedTimeEquals(expectedTag, commitPub.Auth.ConfirmationTag),
-                $"Confirmation tag mismatch at epoch {state.Epoch + 1}");
-
-            // Compute interim transcript hash per RFC 9420 §8.2
-            byte[] newInterimInput = TlsCodec.Serialize(w => w.WriteOpaqueV(commitPub.Auth.ConfirmationTag!));
-            byte[] newInterimHash = cs.Hash(
-                Concat(newConfirmedTranscriptHash, newInterimInput));
-
-            // Update state
-            state.Tree = tentativeTree;
-            state.KeySchedule = newKeySchedule;
-            state.GroupContext = newGroupContext;
-            state.InterimTranscriptHash = newInterimHash;
-            state.Extensions = tentativeExtensions;
-            state.Epoch = state.Epoch + 1;
-            state.ResumptionPsks[state.Epoch] = newKeySchedule.ResumptionPsk;
-        }
-        else
-        {
-            // No UpdatePath: commit_secret = zeros
-            commitSecret = new byte[cs.SecretSize];
-
-            // RFC 9420 §7.7: When there's no UpdatePath, add each newly added leaf
-            // to unmerged_leaves of ALL non-blank parent nodes on its direct path.
-            // The new member doesn't know any parent keys, so all parent nodes
-            // above it need to track it as unmerged.
-            foreach (uint addedLeaf in addedLeaves)
-            {
-                var addedDp = TreeMath.DirectPath(addedLeaf, tentativeTree.LeafCount);
-                foreach (uint dpNode in addedDp)
-                {
-                    var pn = tentativeTree.GetParent(dpNode);
-                    if (pn != null)
-                        pn.UnmergedLeaves.Add(addedLeaf);
-                }
-            }
-
-            // Compute tree hash
-            uint root = TreeMath.Root(tentativeTree.LeafCount);
-            byte[] treeHash = tentativeTree.ComputeTreeHash(cs, root);
-
-            // ConfirmedTranscriptHashInput per RFC 9420 §8.2
-            byte[] confirmedInput2 = TlsCodec.Serialize(w =>
-            {
-                w.WriteUint16((ushort)WireFormat.MlsPublicMessage);
-                content.WriteTo(w);
-                w.WriteOpaqueV(commitPub.Auth.Signature);
-            });
-            byte[] newConfirmedTranscriptHash = cs.Hash(
-                Concat(state.InterimTranscriptHash, confirmedInput2));
-
-            var newGroupContext = new GroupContext
-            {
-                Version = ProtocolVersion.Mls10,
-                CipherSuite = cs.Id,
-                GroupId = state.GroupContext.GroupId,
-                Epoch = state.Epoch + 1,
-                TreeHash = treeHash,
-                ConfirmedTranscriptHash = newConfirmedTranscriptHash,
-                Extensions = tentativeExtensions,
-            };
-            byte[] newCtxBytes = TlsCodec.Serialize(w => newGroupContext.WriteTo(w));
-
-            // PSK secret
-            byte[]? pskSecretParam = ComputePskSecretFromProposals(pskIds, v, cs, state);
-
-            var newKeySchedule = KeyScheduleEpoch.Create(
-                cs, state.KeySchedule.InitSecret, commitSecret, newCtxBytes, pskSecretParam);
-
-            byte[] expectedTag = newKeySchedule.ComputeConfirmationTag(cs, newConfirmedTranscriptHash);
-            Assert.True(
-                commitPub.Auth.ConfirmationTag != null &&
-                CryptographicOperations.FixedTimeEquals(expectedTag, commitPub.Auth.ConfirmationTag),
-                $"Confirmation tag mismatch at epoch {state.Epoch + 1}");
-
-            byte[] newInterimInput = TlsCodec.Serialize(w => w.WriteOpaqueV(commitPub.Auth.ConfirmationTag!));
-            byte[] newInterimHash = cs.Hash(
-                Concat(newConfirmedTranscriptHash, newInterimInput));
-
-            state.Tree = tentativeTree;
-            state.KeySchedule = newKeySchedule;
-            state.GroupContext = newGroupContext;
-            state.InterimTranscriptHash = newInterimHash;
-            state.Extensions = tentativeExtensions;
-            state.Epoch = state.Epoch + 1;
-            state.ResumptionPsks[state.Epoch] = newKeySchedule.ResumptionPsk;
-        }
-
-        // Clean up stale private keys for nodes that are now blank or out of bounds
-        var staleKeys = new List<uint>();
-        foreach (var (nodeIdx, _) in state.PrivateKeys)
-        {
-            if (nodeIdx == TreeMath.LeafToNode(state.MyLeafIndex))
-                continue; // Always keep our own leaf key
-            if (nodeIdx >= (uint)state.Tree.NodeCount)
-            {
-                staleKeys.Add(nodeIdx);
-                continue;
-            }
-            if (TreeMath.IsLeaf(nodeIdx))
-            {
-                var leaf = state.Tree.GetLeaf(nodeIdx / 2);
-                if (leaf == null) staleKeys.Add(nodeIdx);
-            }
-            else
-            {
-                var par = state.Tree.GetParent(nodeIdx);
-                if (par == null) staleKeys.Add(nodeIdx);
-            }
-        }
-        foreach (var key in staleKeys)
-            state.PrivateKeys.Remove(key);
+        // Process commit via production code
+        group.ProcessCommit(commitPub);
     }
+
 
     // ---- Passive Client: Welcome Test Vectors ----
 
@@ -2628,13 +2038,13 @@ public class Rfc9420TestVectorTests
     public void PassiveClient_Welcome_MatchesOfficialVectors(PassiveClientVector v)
     {
         var cs = new CipherSuite0x0001();
-        var state = ProcessWelcomeForPassiveClient(v, cs);
-        Assert.Equal(Hex(v.InitialEpochAuthenticator), state.KeySchedule.EpochAuthenticator);
+        var group = ProcessWelcomeForPassiveClient(v, cs);
+        Assert.Equal(Hex(v.InitialEpochAuthenticator), group.KeySchedule.EpochAuthenticator);
 
         foreach (var epoch in v.Epochs)
         {
-            ProcessEpochForPassiveClient(state, epoch, v, cs);
-            Assert.Equal(Hex(epoch.EpochAuthenticator), state.KeySchedule.EpochAuthenticator);
+            ProcessEpochForPassiveClient(group, epoch, v, cs);
+            Assert.Equal(Hex(epoch.EpochAuthenticator), group.KeySchedule.EpochAuthenticator);
         }
     }
 
@@ -2653,20 +2063,20 @@ public class Rfc9420TestVectorTests
     public void PassiveClient_HandlingCommit_MatchesOfficialVectors(PassiveClientVector v)
     {
         var cs = new CipherSuite0x0001();
-        var state = ProcessWelcomeForPassiveClient(v, cs);
-        Assert.Equal(Hex(v.InitialEpochAuthenticator), state.KeySchedule.EpochAuthenticator);
+        var group = ProcessWelcomeForPassiveClient(v, cs);
+        Assert.Equal(Hex(v.InitialEpochAuthenticator), group.KeySchedule.EpochAuthenticator);
 
         for (int i = 0; i < v.Epochs.Length; i++)
         {
             try
             {
-                ProcessEpochForPassiveClient(state, v.Epochs[i], v, cs);
+                ProcessEpochForPassiveClient(group, v.Epochs[i], v, cs);
             }
             catch (Exception ex)
             {
-                throw new Exception($"Epoch {i} (epoch={state.Epoch}) failed: {ex.Message}", ex);
+                throw new Exception($"Epoch {i} (epoch={group.Epoch}) failed: {ex.Message}", ex);
             }
-            Assert.Equal(Hex(v.Epochs[i].EpochAuthenticator), state.KeySchedule.EpochAuthenticator);
+            Assert.Equal(Hex(v.Epochs[i].EpochAuthenticator), group.KeySchedule.EpochAuthenticator);
         }
     }
 
@@ -2685,51 +2095,14 @@ public class Rfc9420TestVectorTests
     public void PassiveClient_Random_MatchesOfficialVectors(PassiveClientVector v)
     {
         var cs = new CipherSuite0x0001();
-        var state = ProcessWelcomeForPassiveClient(v, cs);
-        Assert.Equal(Hex(v.InitialEpochAuthenticator), state.KeySchedule.EpochAuthenticator);
+        var group = ProcessWelcomeForPassiveClient(v, cs);
+        Assert.Equal(Hex(v.InitialEpochAuthenticator), group.KeySchedule.EpochAuthenticator);
 
         for (int i = 0; i < v.Epochs.Length; i++)
         {
-            ProcessEpochForPassiveClient(state, v.Epochs[i], v, cs);
-            Assert.Equal(Hex(v.Epochs[i].EpochAuthenticator), state.KeySchedule.EpochAuthenticator);
+            ProcessEpochForPassiveClient(group, v.Epochs[i], v, cs);
+            Assert.Equal(Hex(v.Epochs[i].EpochAuthenticator), group.KeySchedule.EpochAuthenticator);
         }
-    }
-
-    private byte[]? ComputePskSecretFromProposals(
-        List<PreSharedKeyId> pskIds, PassiveClientVector v, ICipherSuite cs,
-        PassiveClientState state)
-    {
-        if (pskIds.Count == 0) return null;
-
-        var pskInputs = pskIds.Select((id, idx) =>
-        {
-            byte[] pskValue = Array.Empty<byte>();
-            if (id.PskType == PskType.External)
-            {
-                foreach (var extPsk in v.ExternalPsks)
-                {
-                    if (Hex(extPsk.PskId).AsSpan().SequenceEqual(id.PskId))
-                    {
-                        pskValue = Hex(extPsk.Psk);
-                        break;
-                    }
-                }
-                Assert.True(pskValue.Length > 0,
-                    $"PSK[{idx}] External PskId={Convert.ToHexString(id.PskId).ToLowerInvariant()} " +
-                    $"not found in {v.ExternalPsks.Length} external PSKs. " +
-                    $"Available: [{string.Join(",", v.ExternalPsks.Select(p => p.PskId))}]");
-            }
-            else if (id.PskType == PskType.Resumption)
-            {
-                Assert.True(state.ResumptionPsks.ContainsKey(id.ResumptionEpoch),
-                    $"PSK[{idx}] Resumption PSK for epoch {id.ResumptionEpoch} not found. " +
-                    $"Available epochs: [{string.Join(",", state.ResumptionPsks.Keys)}]");
-                pskValue = state.ResumptionPsks[id.ResumptionEpoch];
-            }
-            return new PskSecretDerivation.PskInput { Id = id, PskValue = pskValue };
-        }).ToArray();
-
-        return PskSecretDerivation.ComputePskSecret(cs, pskInputs);
     }
 
 }

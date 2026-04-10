@@ -78,6 +78,31 @@ public static class MessageFraming
     }
 
     // --- AuthenticatedContentTBM (To Be MACed for membership tag) ---
+
+    /// <summary>
+    /// Builds the ConfirmedTranscriptHashInput per RFC 9420 §8.2:
+    /// <code>
+    /// struct {
+    ///     WireFormat wire_format;
+    ///     FramedContent content;      /* with content_type == commit */
+    ///     opaque signature&lt;V&gt;;
+    /// } ConfirmedTranscriptHashInput;
+    /// </code>
+    /// </summary>
+    public static byte[] BuildConfirmedTranscriptHashInput(
+        WireFormat wireFormat,
+        FramedContent content,
+        byte[] signature)
+    {
+        return TlsCodec.Serialize(writer =>
+        {
+            writer.WriteUint16((ushort)wireFormat);
+            content.WriteTo(writer);
+            writer.WriteOpaqueV(signature);
+        });
+    }
+
+    // --- AuthenticatedContentTBM (To Be MACed for membership tag) ---
     // Per RFC 9420 Section 6.1:
     //
     // struct {
