@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using Org.BouncyCastle.Crypto.Agreement;
 using Org.BouncyCastle.Crypto.Generators;
 using Org.BouncyCastle.Crypto.Parameters;
@@ -51,6 +52,14 @@ public sealed class X25519Provider
 
         var sharedSecret = new byte[agreement.AgreementSize];
         agreement.CalculateAgreement(publicKeyParams, sharedSecret, 0);
+
+        // RFC 7748 §6.1: reject the all-zero output, which indicates the peer
+        // contributed a low-order point. An all-zero shared secret leaks no
+        // information but would still allow an active attacker to force a
+        // predictable DH result in protocols that don't check.
+        var zero = new byte[sharedSecret.Length];
+        if (CryptographicOperations.FixedTimeEquals(sharedSecret, zero))
+            throw new CryptographicException("X25519 produced an all-zero shared secret (low-order point).");
 
         return sharedSecret;
     }

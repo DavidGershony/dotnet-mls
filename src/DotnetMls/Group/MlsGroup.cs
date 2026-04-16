@@ -299,6 +299,7 @@ public sealed class MlsGroup
             if (proposal is AddProposal add)
             {
                 var leafNode = add.KeyPackage.LeafNode;
+                ValidateAddLeafCapabilities(leafNode, ProtocolVersion.Mls10, _cs.Id);
                 uint newIdx = tentativeTree.AddLeaf(leafNode);
                 addedLeaves.Add(newIdx);
                 newMembers.Add((add.KeyPackage, add.KeyPackage.InitKey));
@@ -309,6 +310,7 @@ public sealed class MlsGroup
             }
             else if (proposal is GroupContextExtensionsProposal gce)
             {
+                ValidateGroupContextExtensions(gce.Extensions, tentativeTree);
                 tentativeExtensions = gce.Extensions;
             }
             // UpdateProposal is handled via the UpdatePath below
@@ -316,7 +318,7 @@ public sealed class MlsGroup
 
         // Generate new leaf node for the committer with fresh key material.
         // EncryptionKey is a placeholder — Encap will overwrite it with the derived key.
-        var (newHpkePriv, newHpkePub) = _cs.GenerateHpkeKeyPair();
+        var (_, newHpkePub) = _cs.GenerateHpkeKeyPair();
         var currentLeaf = _tree.GetLeaf(_myLeafIndex)!;
         var newLeafNode = new LeafNode
         {
@@ -353,7 +355,7 @@ public sealed class MlsGroup
         // new public keys (Phase 1) but before encryption (Phase 2).
         // Inside the factory, we compute parent hashes, add unmerged leaves for
         // added members, and sign the leaf so the tree hash matches ProcessCommitCore.
-        var (updatePath, commitSecret) = TreeKem.Encap(
+        var (updatePath, newHpkePriv, commitSecret) = TreeKem.Encap(
             tentativeTree, _myLeafIndex, _cs, newLeafNode, () =>
             {
                 // Compute filtered direct path (same as what Encap uses internally)
@@ -575,16 +577,34 @@ public sealed class MlsGroup
         var content = commitMessage.Content;
         var auth = commitMessage.Auth;
 
-        // Verify membership tag for public messages
         byte[] serializedContext = SerializeGroupContext(_groupContext);
-        bool valid = MessageFraming.VerifyPublicMessage(
-            commitMessage,
-            _tree.GetLeaf(content.Sender.LeafIndex)!.SignatureKey,
-            serializedContext,
-            _cs,
-            _keySchedule.MembershipKey);
-        if (!valid)
-            throw new InvalidOperationException("Invalid public message signature or membership tag.");
+
+        if (content.Sender.SenderType == SenderType.NewMemberCommit)
+        {
+            // RFC 9420 §12.4.3.2: an external joiner's commit. The signer key
+            // comes from the UpdatePath's LeafNode (they're not yet in the tree),
+            // and there is no membership tag because they're not yet a member.
+            var parsedCommit = Types.Commit.ReadFrom(new TlsReader(content.Content));
+            if (parsedCommit.Path == null)
+                throw new InvalidOperationException("External commit must include an UpdatePath.");
+
+            byte[] tbs = MessageFraming.BuildFramedContentTbs(
+                WireFormat.MlsPublicMessage, content, serializedContext);
+            if (!_cs.VerifyWithLabel(
+                    parsedCommit.Path.LeafNode.SignatureKey, "FramedContentTBS", tbs, auth.Signature))
+                throw new InvalidOperationException("Invalid external commit signature.");
+        }
+        else
+        {
+            bool valid = MessageFraming.VerifyPublicMessage(
+                commitMessage,
+                _tree.GetLeaf(content.Sender.LeafIndex)!.SignatureKey,
+                serializedContext,
+                _cs,
+                _keySchedule.MembershipKey);
+            if (!valid)
+                throw new InvalidOperationException("Invalid public message signature or membership tag.");
+        }
 
         ProcessCommitCore(content, auth, WireFormat.MlsPublicMessage);
     }
@@ -626,22 +646,34 @@ public sealed class MlsGroup
         if (content.ContentType != ContentType.Commit)
             throw new ArgumentException("Not a commit message.");
 
-        // Verify signature using CURRENT group context
-        uint senderLeaf = content.Sender.LeafIndex;
-        var senderLeafNode = _tree.GetLeaf(senderLeaf);
-        if (senderLeafNode == null)
-            throw new InvalidOperationException("Sender leaf is blank.");
-
-        byte[] senderPublicKey = senderLeafNode.SignatureKey;
+        bool isExternalCommit = content.Sender.SenderType == SenderType.NewMemberCommit;
         byte[] serializedContext = SerializeGroupContext(_groupContext);
-
-        byte[] tbs = MessageFraming.BuildFramedContentTbs(
-            wireFormat, content, serializedContext);
-        if (!_cs.VerifyWithLabel(senderPublicKey, "FramedContentTBS", tbs, auth.Signature))
-            throw new InvalidOperationException("Invalid commit signature.");
 
         // Parse the commit
         var commit = Types.Commit.ReadFrom(new TlsReader(content.Content));
+
+        uint senderLeaf;
+        if (isExternalCommit)
+        {
+            // External joiner's signature is already verified by the caller using
+            // commit.Path.LeafNode.SignatureKey (they aren't in the tree yet).
+            if (commit.Path == null)
+                throw new InvalidOperationException("External commit must include an UpdatePath.");
+            senderLeaf = uint.MaxValue; // placeholder; resolved after we pick the slot
+        }
+        else
+        {
+            senderLeaf = content.Sender.LeafIndex;
+            var senderLeafNode = _tree.GetLeaf(senderLeaf);
+            if (senderLeafNode == null)
+                throw new InvalidOperationException("Sender leaf is blank.");
+
+            byte[] senderPublicKey = senderLeafNode.SignatureKey;
+            byte[] tbs = MessageFraming.BuildFramedContentTbs(
+                wireFormat, content, serializedContext);
+            if (!_cs.VerifyWithLabel(senderPublicKey, "FramedContentTBS", tbs, auth.Signature))
+                throw new InvalidOperationException("Invalid commit signature.");
+        }
 
         // Clone tree for tentative processing
         var tentativeTree = _tree.Clone();
@@ -655,6 +687,7 @@ public sealed class MlsGroup
         var removes = new List<RemoveProposal>();
         var adds = new List<AddProposal>();
         var gces = new List<GroupContextExtensionsProposal>();
+        ExternalInitProposal? externalInit = null;
 
         foreach (var por in commit.Proposals)
         {
@@ -682,14 +715,41 @@ public sealed class MlsGroup
             else if (proposal is UpdateProposal update) updates.Add((update, proposerLeaf));
             else if (proposal is PreSharedKeyProposal pskProp) pskIds.Add(pskProp.Psk);
             else if (proposal is GroupContextExtensionsProposal gce) gces.Add(gce);
+            else if (proposal is ExternalInitProposal ei) externalInit = ei;
         }
+
+        if (isExternalCommit && externalInit == null)
+            throw new InvalidOperationException(
+                "External commit is missing an ExternalInit proposal.");
+        if (!isExternalCommit && externalInit != null)
+            throw new InvalidOperationException(
+                "ExternalInit proposal appeared in a non-external commit.");
 
         // Apply in type order: GCE → Update → Remove → Add
         foreach (var gce in gces)
+        {
+            ValidateGroupContextExtensions(gce.Extensions, tentativeTree);
             tentativeExtensions = gce.Extensions;
+        }
 
         foreach (var (update, propLeaf) in updates)
         {
+            // RFC 9420 §12.1.2: verify the Update proposal's LeafNode signature,
+            // and confirm the signer matches the proposer's existing leaf.
+            if (update.LeafNode.Source != LeafNodeSource.Update)
+                throw new InvalidOperationException(
+                    $"Update proposal LeafNode source must be Update, got {update.LeafNode.Source}.");
+            var currentLeafAtSender = tentativeTree.GetLeaf(propLeaf);
+            if (currentLeafAtSender == null)
+                throw new InvalidOperationException(
+                    $"Update proposal from blank leaf {propLeaf}.");
+            if (!currentLeafAtSender.SignatureKey.AsSpan().SequenceEqual(update.LeafNode.SignatureKey))
+                throw new InvalidOperationException(
+                    $"Update proposal signature key does not match leaf {propLeaf}.");
+            if (!VerifyLeafNodeSignature(_cs, update.LeafNode, _groupId, propLeaf))
+                throw new InvalidOperationException(
+                    $"Invalid Update proposal LeafNode signature at leaf {propLeaf}.");
+
             tentativeTree.SetLeaf(propLeaf, update.LeafNode);
             var updateDp = TreeMath.DirectPath(propLeaf, tentativeTree.LeafCount);
             foreach (uint dpNode in updateDp)
@@ -719,8 +779,31 @@ public sealed class MlsGroup
         var addedLeaves = new List<uint>();
         foreach (var add in adds)
         {
+            ValidateAddLeafCapabilities(add.KeyPackage.LeafNode, ProtocolVersion.Mls10, _cs.Id);
             uint newLeafIdx = tentativeTree.AddLeaf(add.KeyPackage.LeafNode);
             addedLeaves.Add(newLeafIdx);
+        }
+
+        // External commit: place the joiner into the tree. RFC 9420 §12.4.3.2:
+        // - If the commit removes an existing leaf (their prior membership),
+        //   that leaf's slot is reused.
+        // - Otherwise, they take a blank slot or extend the tree, like AddLeaf.
+        if (isExternalCommit)
+        {
+
+            ValidateAddLeafCapabilities(commit.Path!.LeafNode, ProtocolVersion.Mls10, _cs.Id);
+            uint joinerLeaf;
+            if (removes.Count > 0)
+            {
+                joinerLeaf = removes.OrderBy(r => r.LeafIndex).First().LeafIndex;
+                tentativeTree.SetLeaf(joinerLeaf, commit.Path.LeafNode);
+            }
+            else
+            {
+                joinerLeaf = tentativeTree.AddLeaf(commit.Path.LeafNode);
+            }
+            senderLeaf = joinerLeaf;
+            addedLeaves.Add(joinerLeaf);
         }
 
         // ---- Process UpdatePath if present ----
@@ -729,6 +812,15 @@ public sealed class MlsGroup
         {
             // Save tree state AFTER proposals but BEFORE UpdatePath for sibling tree hash
             var originalTree = tentativeTree.Clone();
+
+            // RFC 9420 §7.2: a Commit-source LeafNode must carry a parent_hash.
+            var pathLeaf = commit.Path.LeafNode;
+            if (pathLeaf.Source != LeafNodeSource.Commit)
+                throw new InvalidOperationException(
+                    $"UpdatePath LeafNode source must be Commit, got {pathLeaf.Source}.");
+            if (pathLeaf.ParentHash.Length == 0)
+                throw new InvalidOperationException(
+                    "UpdatePath LeafNode has empty parent_hash.");
 
             // Apply UpdatePath public state to tentative tree
             tentativeTree.SetLeaf(senderLeaf, commit.Path.LeafNode);
@@ -936,8 +1028,22 @@ public sealed class MlsGroup
             pskSecret = PskSecretDerivation.ComputePskSecret(_cs, pskInputs);
         }
 
+        byte[] initSecretForNewEpoch;
+        if (isExternalCommit)
+        {
+            // RFC 9420 §12.4.3.2: init_secret comes from the ExternalInit shared_secret,
+            // derived by HPKE Decap against external_priv (itself derived from the
+            // current epoch's external_secret).
+            var (externalPriv, _) = _cs.DeriveHpkeKeyPair(_keySchedule.ExternalSecret);
+            initSecretForNewEpoch = _cs.HpkeDecap(externalInit!.KemOutput, externalPriv);
+        }
+        else
+        {
+            initSecretForNewEpoch = _keySchedule.InitSecret;
+        }
+
         var newKeySchedule = KeyScheduleEpoch.Create(
-            _cs, _keySchedule.InitSecret, commitSecret, newContextBytes, pskSecret);
+            _cs, initSecretForNewEpoch, commitSecret, newContextBytes, pskSecret);
 
         // Verify confirmation tag
         byte[] expectedTag = newKeySchedule.ComputeConfirmationTag(
@@ -992,6 +1098,15 @@ public sealed class MlsGroup
         Dictionary<string, byte[]>? externalPsks = null)
     {
         config ??= MlsGroupConfig.Default;
+
+        // RFC 9420 §12.4.3.1: the Welcome's cipher suite must match our KeyPackage's.
+        // A mismatch means the group uses a different cipher suite than we committed to.
+        if (welcome.CipherSuite != myKeyPackage.CipherSuite)
+            throw new InvalidOperationException(
+                $"Welcome cipher suite 0x{welcome.CipherSuite:X4} does not match KeyPackage cipher suite 0x{myKeyPackage.CipherSuite:X4}.");
+        if (welcome.CipherSuite != cs.Id)
+            throw new InvalidOperationException(
+                $"Welcome cipher suite 0x{welcome.CipherSuite:X4} does not match provided cipher suite 0x{cs.Id:X4}.");
 
         // Compute our key package reference
         byte[] myKpBytes = TlsCodec.Serialize(writer => myKeyPackage.WriteTo(writer));
@@ -1071,7 +1186,7 @@ public sealed class MlsGroup
             byte[]? ratchetTreeData = null;
             foreach (var ext in groupInfo.Extensions)
             {
-                if (ext.ExtensionType == 0x0002) // ratchet_tree
+                if (ext.ExtensionType == ExtensionType.RatchetTree)
                 {
                     ratchetTreeData = ext.ExtensionData;
                     break;
@@ -1200,6 +1315,245 @@ public sealed class MlsGroup
         return group;
     }
 
+    // -- External Commit (join without a Welcome) --
+
+    /// <summary>
+    /// Joins a group via an External Commit (RFC 9420 §12.4.3.2) using a
+    /// published <see cref="GroupInfo"/> that carries the <c>external_pub</c>
+    /// extension. Returns the commit message to broadcast to the group and the
+    /// local <see cref="MlsGroup"/> in the new epoch. The commit must be
+    /// accepted by every existing member via <see cref="ProcessCommit(PublicMessage)"/>.
+    /// </summary>
+    /// <param name="cs">The cipher suite. Must match the group's cipher suite.</param>
+    /// <param name="groupInfo">A signed GroupInfo from a current member.</param>
+    /// <param name="identity">The joiner's identity bytes for BasicCredential.</param>
+    /// <param name="signingPrivateKey">The joiner's private signing key.</param>
+    /// <param name="signingPublicKey">The joiner's public signing key.</param>
+    /// <param name="config">Group configuration, or null for defaults.</param>
+    /// <returns>A tuple of (commit PublicMessage to broadcast, new MlsGroup).</returns>
+    public static (PublicMessage commitMessage, MlsGroup group) JoinExternal(
+        ICipherSuite cs,
+        GroupInfo groupInfo,
+        byte[] identity,
+        byte[] signingPrivateKey,
+        byte[] signingPublicKey,
+        MlsGroupConfig? config = null)
+    {
+        config ??= MlsGroupConfig.Default;
+
+        // Cipher suite must match
+        if (groupInfo.GroupContext.CipherSuite != cs.Id)
+            throw new InvalidOperationException(
+                $"GroupInfo cipher suite 0x{groupInfo.GroupContext.CipherSuite:X4} does not match 0x{cs.Id:X4}.");
+
+        // Extract ratchet_tree and external_pub extensions
+        byte[]? ratchetTreeData = null;
+        byte[]? externalPubKey = null;
+        foreach (var ext in groupInfo.Extensions)
+        {
+            if (ext.ExtensionType == ExtensionType.RatchetTree)
+                ratchetTreeData = ext.ExtensionData;
+            else if (ext.ExtensionType == ExtensionType.ExternalPub)
+            {
+                var epReader = new TlsReader(ext.ExtensionData);
+                externalPubKey = epReader.ReadOpaqueV();
+            }
+        }
+        if (ratchetTreeData == null)
+            throw new InvalidOperationException("GroupInfo is missing the ratchet_tree extension.");
+        if (externalPubKey == null)
+            throw new InvalidOperationException("GroupInfo is missing the external_pub extension.");
+
+        var tree = RatchetTree.ReadFrom(new TlsReader(ratchetTreeData));
+
+        // Verify the GroupInfo signature using the signer's current leaf.
+        var signerLeaf = tree.GetLeaf(groupInfo.Signer)
+            ?? throw new InvalidOperationException(
+                $"GroupInfo signer leaf {groupInfo.Signer} is blank.");
+        byte[] giTbs = TlsCodec.Serialize(writer =>
+        {
+            groupInfo.GroupContext.WriteTo(writer);
+            writer.WriteVectorV(inner =>
+            {
+                foreach (var ext in groupInfo.Extensions)
+                    ext.WriteTo(inner);
+            });
+            writer.WriteOpaqueV(groupInfo.ConfirmationTag);
+            writer.WriteUint32(groupInfo.Signer);
+        });
+        if (!cs.VerifyWithLabel(signerLeaf.SignatureKey, "GroupInfoTBS", giTbs, groupInfo.Signature))
+            throw new InvalidOperationException("Invalid GroupInfo signature.");
+
+        // HPKE Encap against external_pub → shared_secret becomes new init_secret.
+        var (kemOutput, sharedSecret) = cs.HpkeEncap(externalPubKey);
+
+        // Build our new leaf node (source = Commit).
+        var (hpkePriv, hpkePub) = cs.GenerateHpkeKeyPair();
+        var newLeafNode = new LeafNode
+        {
+            EncryptionKey = hpkePub,
+            SignatureKey = signingPublicKey,
+            Credential = new BasicCredential(identity),
+            Capabilities = CreateDefaultCapabilities(cs),
+            Source = LeafNodeSource.Commit,
+            Extensions = Array.Empty<Extension>()
+        };
+
+        // Place ourselves into the tentative tree. AddLeaf reuses a blank slot
+        // when available, otherwise extends — same slot the receiver will use.
+        // The placeholder hpkePriv is replaced with the leaf key derived by Encap.
+        _ = hpkePriv;
+        var tentativeTree = tree.Clone();
+        uint myLeafIndex = tentativeTree.AddLeaf(newLeafNode);
+        var addedLeaves = new List<uint> { myLeafIndex };
+
+        byte[] groupId = groupInfo.GroupContext.GroupId;
+        var tentativeExtensions = groupInfo.GroupContext.Extensions;
+
+        // Provisional GroupContext (epoch+1, tree_hash filled by factory,
+        // confirmed_transcript_hash carries over from current GroupInfo).
+        var tentativeContext = new GroupContext
+        {
+            Version = ProtocolVersion.Mls10,
+            CipherSuite = cs.Id,
+            GroupId = groupId,
+            Epoch = groupInfo.GroupContext.Epoch + 1,
+            TreeHash = Array.Empty<byte>(),
+            ConfirmedTranscriptHash = groupInfo.GroupContext.ConfirmedTranscriptHash,
+            Extensions = tentativeExtensions
+        };
+
+        var originalTree = tentativeTree.Clone();
+
+        var (updatePath, newHpkePriv, commitSecret) = TreeKem.Encap(
+            tentativeTree, myLeafIndex, cs, newLeafNode, () =>
+            {
+                var dp = TreeMath.DirectPath(myLeafIndex, tentativeTree.LeafCount);
+                var addedNodeIndices = new HashSet<uint> { TreeMath.LeafToNode(myLeafIndex) };
+                var cp = TreeMath.Copath(myLeafIndex, tentativeTree.LeafCount);
+                var fdp = new List<uint>();
+                for (int i = 0; i < dp.Length; i++)
+                {
+                    var res = tentativeTree.Resolution(cp[i]);
+                    if (res.Any(n => !addedNodeIndices.Contains(n)))
+                        fdp.Add(dp[i]);
+                }
+
+                for (int i = fdp.Count - 2; i >= 0; i--)
+                {
+                    uint nodeIdx = fdp[i];
+                    uint parentIdx = fdp[i + 1];
+                    uint siblingIdx = nodeIdx < parentIdx
+                        ? TreeMath.Right(parentIdx)
+                        : TreeMath.Left(parentIdx);
+                    byte[] siblingTreeHash = originalTree.ComputeTreeHash(cs, siblingIdx);
+                    byte[] parentHash = tentativeTree.ComputeParentHash(cs, parentIdx, siblingTreeHash);
+                    tentativeTree.GetParent(nodeIdx)!.ParentHash = parentHash;
+                }
+
+                if (fdp.Count > 0)
+                {
+                    uint firstParent = fdp[0];
+                    uint leafNodeIdx = TreeMath.LeafToNode(myLeafIndex);
+                    uint lc = TreeMath.Left(firstParent);
+                    uint rc = TreeMath.Right(firstParent);
+                    uint siblingOfFirst = (leafNodeIdx == lc) ? rc : lc;
+                    byte[] siblingTreeHash = originalTree.ComputeTreeHash(cs, siblingOfFirst);
+                    newLeafNode.ParentHash = tentativeTree.ComputeParentHash(cs, firstParent, siblingTreeHash);
+                }
+                else
+                {
+                    newLeafNode.ParentHash = new byte[cs.HashSize];
+                }
+
+                SignLeafNode(cs, newLeafNode, signingPrivateKey, groupId, myLeafIndex);
+                tentativeTree.SetLeaf(myLeafIndex, newLeafNode);
+
+                var root0 = TreeMath.Root(tentativeTree.LeafCount);
+                tentativeContext.TreeHash = tentativeTree.ComputeTreeHash(cs, root0);
+                return SerializeGroupContext(tentativeContext);
+            }, addedLeaves);
+
+        updatePath = new UpdatePath(newLeafNode, updatePath.Nodes);
+
+        // Build Commit with a single inline ExternalInit proposal.
+        var externalInit = new ExternalInitProposal(kemOutput);
+        var proposalOrRefs = new ProposalOrRef[] { new InlineProposal(externalInit) };
+        var commit = new Commit(proposalOrRefs, updatePath);
+        byte[] commitBytes = TlsCodec.Serialize(writer => commit.WriteTo(writer));
+
+        // FramedContent with NewMemberCommit sender. The committer's leaf_index
+        // is the slot we just occupied.
+        var framedContent = new FramedContent
+        {
+            GroupId = groupId,
+            Epoch = groupInfo.GroupContext.Epoch,
+            Sender = new Sender(SenderType.NewMemberCommit, 0),
+            AuthenticatedData = Array.Empty<byte>(),
+            ContentType = ContentType.Commit,
+            Content = commitBytes
+        };
+
+        byte[] serializedCurrentContext = SerializeGroupContext(groupInfo.GroupContext);
+        byte[] tbs = MessageFraming.BuildFramedContentTbs(
+            WireFormat.MlsPublicMessage, framedContent, serializedCurrentContext);
+        byte[] signature = cs.SignWithLabel(signingPrivateKey, "FramedContentTBS", tbs);
+
+        byte[] confirmedInput = MessageFraming.BuildConfirmedTranscriptHashInput(
+            WireFormat.MlsPublicMessage, framedContent, signature);
+
+        // Finalize GroupContext with the final tree hash and confirmed transcript hash.
+        var rootFinal = TreeMath.Root(tentativeTree.LeafCount);
+        byte[] finalTreeHash = tentativeTree.ComputeTreeHash(cs, rootFinal);
+        tentativeContext.TreeHash = finalTreeHash;
+        // InterimTranscriptHash prior to this commit uses the GroupInfo's confirmation tag.
+        byte[] priorInterim;
+        {
+            byte[] interimInput = TlsCodec.Serialize(w => w.WriteOpaqueV(groupInfo.ConfirmationTag));
+            priorInterim = cs.Hash(
+                Concat(groupInfo.GroupContext.ConfirmedTranscriptHash, interimInput));
+        }
+        byte[] newConfirmedTranscriptHash = cs.Hash(Concat(priorInterim, confirmedInput));
+        tentativeContext.ConfirmedTranscriptHash = newConfirmedTranscriptHash;
+        byte[] newContextBytes = SerializeGroupContext(tentativeContext);
+
+        // New key schedule: init_secret = shared_secret from ExternalInit (§12.4.3.2),
+        // commit_secret from TreeKEM, no prior epoch init_secret.
+        var newKeySchedule = KeyScheduleEpoch.Create(
+            cs, sharedSecret, commitSecret, newContextBytes);
+
+        byte[] confirmationTag = newKeySchedule.ComputeConfirmationTag(
+            cs, newConfirmedTranscriptHash);
+        var auth = new FramedContentAuthData(signature, confirmationTag);
+
+        // External commits are sent as PublicMessage (no membership tag because
+        // the sender isn't yet a member).
+        var publicMessage = new PublicMessage(framedContent, auth, membershipTag: null);
+
+        // Build the new group state.
+        var newTranscriptHash = new TranscriptHash(cs.HashSize);
+        // The transcript hash for the new epoch is (confirmed, interim) where
+        // interim is computed from the confirmation tag of this commit.
+        byte[] newInterimInput = TlsCodec.Serialize(w => w.WriteOpaqueV(confirmationTag));
+        byte[] newInterimHash = cs.Hash(Concat(newConfirmedTranscriptHash, newInterimInput));
+
+        var group = new MlsGroup(cs, config);
+        group._groupId = groupId;
+        group._epoch = tentativeContext.Epoch;
+        group._tree = tentativeTree;
+        group._myLeafIndex = myLeafIndex;
+        group._mySigningPrivateKey = signingPrivateKey;
+        group._myHpkePrivateKey = newHpkePriv;
+        group._groupContext = tentativeContext;
+        group._keySchedule = newKeySchedule;
+        group._transcriptHash = new TranscriptHash(newConfirmedTranscriptHash, newInterimHash);
+        group._secretTree = new SecretTree(cs, newKeySchedule.EncryptionSecret, tentativeTree.LeafCount);
+        group._extensions = tentativeExtensions;
+        group._resumptionPsks[group._epoch] = newKeySchedule.ResumptionPsk;
+
+        return (publicMessage, group);
+    }
+
     // -- Encrypt an application message --
 
     /// <summary>
@@ -1276,6 +1630,49 @@ public sealed class MlsGroup
         return _keySchedule.DeriveExporterSecret(_cs, label, context, length);
     }
 
+    // -- External join support --
+
+    /// <summary>
+    /// Produces a signed GroupInfo describing this group's current epoch,
+    /// suitable for publishing to non-members who want to join via an
+    /// External Commit (RFC 9420 §12.4.3.2). The GroupInfo carries two
+    /// extensions: <c>ratchet_tree</c> with the current tree, and
+    /// <c>external_pub</c> with the epoch's external HPKE public key.
+    /// </summary>
+    public GroupInfo GetGroupInfo()
+    {
+        byte[] treeBytes = TlsCodec.Serialize(writer => _tree.WriteTo(writer));
+        var treeExtension = new Extension(ExtensionType.RatchetTree, treeBytes);
+
+        byte[] externalPubBytes = TlsCodec.Serialize(w => w.WriteOpaqueV(_keySchedule.ExternalPub));
+        var externalPubExtension = new Extension(ExtensionType.ExternalPub, externalPubBytes);
+
+        var groupInfo = new GroupInfo
+        {
+            GroupContext = _groupContext,
+            ConfirmationTag = _keySchedule.ComputeConfirmationTag(
+                _cs, _groupContext.ConfirmedTranscriptHash),
+            Signer = _myLeafIndex,
+            Extensions = new[] { treeExtension, externalPubExtension }
+        };
+
+        byte[] giTbs = TlsCodec.Serialize(writer =>
+        {
+            groupInfo.GroupContext.WriteTo(writer);
+            writer.WriteVectorV(inner =>
+            {
+                foreach (var ext in groupInfo.Extensions)
+                    ext.WriteTo(inner);
+            });
+            writer.WriteOpaqueV(groupInfo.ConfirmationTag);
+            writer.WriteUint32(groupInfo.Signer);
+        });
+        groupInfo.Signature = _cs.SignWithLabel(
+            _mySigningPrivateKey, "GroupInfoTBS", giTbs);
+
+        return groupInfo;
+    }
+
     // -- Get members --
 
     /// <summary>
@@ -1308,7 +1705,7 @@ public sealed class MlsGroup
         // Build GroupInfo
         // Include the ratchet_tree extension in GroupInfo
         byte[] treeBytes = TlsCodec.Serialize(writer => tree.WriteTo(writer));
-        var treeExtension = new Extension(0x0002, treeBytes);
+        var treeExtension = new Extension(ExtensionType.RatchetTree, treeBytes);
 
         var groupInfo = new GroupInfo
         {
@@ -1419,20 +1816,16 @@ public sealed class MlsGroup
         }
     }
 
-    // ---- Helper: Sign a leaf node ----
+    // ---- Helper: Sign / verify a leaf node ----
 
     /// <summary>
-    /// Signs a leaf node per RFC 9420 Section 7.2.
-    /// The LeafNodeTBS includes all leaf fields except the signature,
-    /// followed by source-specific context per RFC 9420 §7.2:
+    /// Builds the LeafNodeTBS per RFC 9420 §7.2. Source-specific context:
     ///   - KeyPackage: no additional context
-    ///   - Update/Commit: group_id<V> + uint32 leaf_index
+    ///   - Update/Commit: group_id&lt;V&gt; + uint32 leaf_index
     /// </summary>
-    private static void SignLeafNode(
-        ICipherSuite cs, LeafNode leafNode, byte[] signingPrivateKey,
-        byte[]? groupId, uint leafIndex = 0)
+    private static byte[] BuildLeafNodeTbs(LeafNode leafNode, byte[]? groupId, uint leafIndex)
     {
-        byte[] tbs = TlsCodec.Serialize(writer =>
+        return TlsCodec.Serialize(writer =>
         {
             writer.WriteOpaqueV(leafNode.EncryptionKey);
             writer.WriteOpaqueV(leafNode.SignatureKey);
@@ -1452,7 +1845,6 @@ public sealed class MlsGroup
                 foreach (var ext in leafNode.Extensions)
                     ext.WriteTo(inner);
             });
-            // LeafNodeTBS context fields (RFC 9420 §7.2):
             if (leafNode.Source == LeafNodeSource.Update ||
                 leafNode.Source == LeafNodeSource.Commit)
             {
@@ -1461,8 +1853,69 @@ public sealed class MlsGroup
                 writer.WriteUint32(leafIndex);
             }
         });
+    }
 
+    /// <summary>
+    /// Signs a leaf node per RFC 9420 Section 7.2.
+    /// </summary>
+    private static void SignLeafNode(
+        ICipherSuite cs, LeafNode leafNode, byte[] signingPrivateKey,
+        byte[]? groupId, uint leafIndex = 0)
+    {
+        byte[] tbs = BuildLeafNodeTbs(leafNode, groupId, leafIndex);
         leafNode.Signature = cs.SignWithLabel(signingPrivateKey, "LeafNodeTBS", tbs);
+    }
+
+    /// <summary>
+    /// Verifies a leaf node's signature per RFC 9420 §7.2.
+    /// </summary>
+    private static bool VerifyLeafNodeSignature(
+        ICipherSuite cs, LeafNode leafNode, byte[]? groupId, uint leafIndex)
+    {
+        byte[] tbs = BuildLeafNodeTbs(leafNode, groupId, leafIndex);
+        return cs.VerifyWithLabel(
+            leafNode.SignatureKey, "LeafNodeTBS", tbs, leafNode.Signature);
+    }
+
+    /// <summary>
+    /// Validates a proposed GroupContext extensions list (RFC 9420 §12.1.7):
+    /// each extension type must be a known GroupContext extension or be
+    /// supported by every current member's advertised capabilities.
+    /// </summary>
+    private static void ValidateGroupContextExtensions(
+        Extension[] extensions, RatchetTree tree)
+    {
+        foreach (var ext in extensions)
+        {
+            // Extension types valid in GroupContext per RFC 9420 §17.3 and §12.1.7.
+            if (ext.ExtensionType == ExtensionType.RequiredCapabilities ||
+                ext.ExtensionType == ExtensionType.ExternalSenders)
+                continue;
+
+            // Otherwise, every non-blank leaf must advertise this type.
+            for (uint i = 0; i < tree.LeafCount; i++)
+            {
+                var leaf = tree.GetLeaf(i);
+                if (leaf == null) continue;
+                if (Array.IndexOf(leaf.Capabilities.Extensions, ext.ExtensionType) < 0)
+                    throw new InvalidOperationException(
+                        $"GroupContext extension 0x{ext.ExtensionType:X4} is not supported by leaf {i}.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Validates that the added LeafNode advertises support for the group's
+    /// protocol version and cipher suite (RFC 9420 §12.1.1).
+    /// </summary>
+    private static void ValidateAddLeafCapabilities(LeafNode leaf, ushort groupVersion, ushort groupCipherSuite)
+    {
+        if (Array.IndexOf(leaf.Capabilities.Versions, groupVersion) < 0)
+            throw new InvalidOperationException(
+                $"Added leaf does not advertise support for protocol version 0x{groupVersion:X4}.");
+        if (Array.IndexOf(leaf.Capabilities.CipherSuites, groupCipherSuite) < 0)
+            throw new InvalidOperationException(
+                $"Added leaf does not advertise support for cipher suite 0x{groupCipherSuite:X4}.");
     }
 
     // ---- Helper: Create default capabilities ----

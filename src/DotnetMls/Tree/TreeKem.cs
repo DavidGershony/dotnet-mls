@@ -38,8 +38,8 @@ public static class TreeKem
     /// This allows the caller to compute the tree hash from the updated tree.</param>
     /// <param name="addedLeaves">Leaf indices of members added in this commit.
     /// Used to compute the filtered direct path per RFC 9420 §7.6.</param>
-    /// <returns>A tuple of (UpdatePath to send, commitSecret for key schedule).</returns>
-    public static (UpdatePath path, byte[] commitSecret) Encap(
+    /// <returns>A tuple of (UpdatePath to send, new leaf HPKE private key, commitSecret).</returns>
+    public static (UpdatePath path, byte[] leafPrivateKey, byte[] commitSecret) Encap(
         RatchetTree tree,
         uint senderLeafIndex,
         ICipherSuite cs,
@@ -146,7 +146,7 @@ public static class TreeKem
         byte[] commitSecret = cs.DeriveSecret(pathSecret, "path");
 
         var updatePath = new UpdatePath(newLeafNode, updatePathNodes.ToArray());
-        return (updatePath, commitSecret);
+        return (updatePath, leafPriv, commitSecret);
     }
 
     /// <summary>

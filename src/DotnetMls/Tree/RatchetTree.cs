@@ -115,11 +115,17 @@ public sealed class RatchetTree
     /// <summary>
     /// Adds a new leaf to the tree. If there is an empty leaf slot, it is reused.
     /// Otherwise, the tree is extended with a new leaf and the necessary parent node.
+    /// RFC 9420 §7.3: the encryption key must be unique across all leaves.
     /// </summary>
     /// <param name="leaf">The leaf node to add.</param>
     /// <returns>The leaf index (0-based among leaves) of the new leaf.</returns>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when the leaf's encryption key duplicates an existing leaf's.
+    /// </exception>
     public uint AddLeaf(LeafNode leaf)
     {
+        RequireUniqueEncryptionKey(leaf, excludeLeafIndex: uint.MaxValue);
+
         // Try to find an empty slot first
         uint? emptySlot = FindEmptyLeaf();
         if (emptySlot.HasValue)
@@ -140,7 +146,29 @@ public sealed class RatchetTree
         _nodes.Add(new TreeNode.Parent(null)); // parent at odd index
         _nodes.Add(new TreeNode.Leaf(leaf));    // leaf at even index
 
+        // Direct path blanking is intentionally NOT done here. RFC 9420 official
+        // passive-client vectors require that, when a Commit has no UpdatePath,
+        // the added leaf is registered on non-blank ancestors' unmerged_leaves
+        // (see ProcessCommitCore). Blanking the DP here would destroy those
+        // ancestors and change the resulting tree hash.
         return LeafCount - 1;
+    }
+
+    /// <summary>
+    /// Verifies that no other leaf already uses the given leaf's encryption key
+    /// (RFC 9420 §7.3).
+    /// </summary>
+    private void RequireUniqueEncryptionKey(LeafNode leaf, uint excludeLeafIndex)
+    {
+        for (uint i = 0; i < LeafCount; i++)
+        {
+            if (i == excludeLeafIndex) continue;
+            var existing = GetLeaf(i);
+            if (existing == null) continue;
+            if (existing.EncryptionKey.AsSpan().SequenceEqual(leaf.EncryptionKey))
+                throw new InvalidOperationException(
+                    $"Duplicate leaf encryption key: leaf {i} already uses this key.");
+        }
     }
 
     /// <summary>
@@ -392,10 +420,24 @@ public sealed class RatchetTree
     /// </summary>
     public void WriteTo(TlsWriter writer)
     {
+        // RFC 9420 §7.5: strip trailing blank nodes so the encoded length
+        // matches the logical leaf count and interoperates with OpenMLS/mls-rs.
+        int end = _nodes.Count;
+        while (end > 0)
+        {
+            var tail = _nodes[end - 1];
+            bool tailBlank = tail == null
+                || (tail is TreeNode.Leaf l && l.Value == null)
+                || (tail is TreeNode.Parent p && p.Value == null);
+            if (!tailBlank) break;
+            end--;
+        }
+
         writer.WriteVectorV(inner =>
         {
-            foreach (var node in _nodes)
+            for (int i = 0; i < end; i++)
             {
+                var node = _nodes[i];
                 if (node == null)
                 {
                     inner.WriteUint8(0); // absent

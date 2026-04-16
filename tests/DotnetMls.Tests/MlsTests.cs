@@ -1449,4 +1449,72 @@ public class LeafNodeSignatureTests
             "Welcome tree: Alice's commit-sourced leaf signature failed verification. " +
             "DotnetMls SignLeafNode must include leaf_index in the LeafNodeTBS.");
     }
+
+    /// <summary>
+    /// External Commit (RFC 9420 §12.4.3.2): Carol joins Alice's group via a
+    /// published GroupInfo (carrying external_pub) without a Welcome.
+    /// </summary>
+    [Fact]
+    public void ExternalCommit_CarolJoinsWithoutWelcome_RoundTrips()
+    {
+        // Alice creates a group, adds Bob via Welcome (so we have 2 members).
+        var (aliceSigPriv, aliceSigPub) = _cs.GenerateSignatureKeyPair();
+        var alice = MlsGroup.CreateGroup(_cs, "alice"u8.ToArray(), aliceSigPriv, aliceSigPub);
+
+        var (bobSigPriv, bobSigPub) = _cs.GenerateSignatureKeyPair();
+        var bobKp = MlsGroup.CreateKeyPackage(
+            _cs, "bob"u8.ToArray(), bobSigPriv, bobSigPub,
+            out var bobInitPriv, out var bobHpkePriv);
+
+        var (_, welcome) = alice.Commit(alice.ProposeAdd(new[] { bobKp }));
+        alice.MergePendingCommit();
+        var bob = MlsGroup.ProcessWelcome(
+            _cs, welcome!, bobKp, bobInitPriv, bobHpkePriv, bobSigPriv);
+
+        // Alice publishes a GroupInfo with external_pub; Carol uses it to join.
+        var groupInfo = alice.GetGroupInfo();
+
+        var (carolSigPriv, carolSigPub) = _cs.GenerateSignatureKeyPair();
+        var (externalCommit, carol) = MlsGroup.JoinExternal(
+            _cs, groupInfo, "carol"u8.ToArray(), carolSigPriv, carolSigPub);
+
+        // Alice and Bob process Carol's external commit.
+        alice.ProcessCommit(externalCommit);
+        bob.ProcessCommit(externalCommit);
+
+        Assert.Equal(alice.Epoch, carol.Epoch);
+        Assert.Equal(bob.Epoch, carol.Epoch);
+        Assert.Equal(3u, alice.Tree.LeafCount);
+        Assert.Equal(3u, bob.Tree.LeafCount);
+        Assert.Equal(3u, carol.Tree.LeafCount);
+        Assert.Equal(alice.GroupContext.ConfirmedTranscriptHash, carol.GroupContext.ConfirmedTranscriptHash);
+        Assert.Equal(alice.GroupContext.TreeHash, carol.GroupContext.TreeHash);
+
+        // Bidirectional messaging after the external commit.
+        var msgFromCarol = carol.EncryptApplicationMessage("hello from carol"u8.ToArray());
+        var (aliceGot, _) = alice.DecryptApplicationMessage(msgFromCarol);
+        Assert.Equal("hello from carol"u8.ToArray(), aliceGot);
+
+        var msgFromBob = bob.EncryptApplicationMessage("hi carol"u8.ToArray());
+        var (carolGot, _) = carol.DecryptApplicationMessage(msgFromBob);
+        Assert.Equal("hi carol"u8.ToArray(), carolGot);
+    }
+
+    /// <summary>
+    /// External Commit cipher-suite mismatch must be rejected.
+    /// </summary>
+    [Fact]
+    public void ExternalCommit_MismatchedCipherSuite_Throws()
+    {
+        var (aliceSigPriv, aliceSigPub) = _cs.GenerateSignatureKeyPair();
+        var alice = MlsGroup.CreateGroup(_cs, "alice"u8.ToArray(), aliceSigPriv, aliceSigPub);
+        var groupInfo = alice.GetGroupInfo();
+        // Pretend GroupInfo is from a different cipher suite.
+        groupInfo.GroupContext.CipherSuite = 0xFFFF;
+
+        var (carolSigPriv, carolSigPub) = _cs.GenerateSignatureKeyPair();
+        Assert.Throws<InvalidOperationException>(() =>
+            MlsGroup.JoinExternal(
+                _cs, groupInfo, "carol"u8.ToArray(), carolSigPriv, carolSigPub));
+    }
 }
