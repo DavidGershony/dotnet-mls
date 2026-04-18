@@ -320,12 +320,33 @@ public sealed class MlsGroup
         // EncryptionKey is a placeholder — Encap will overwrite it with the derived key.
         var (_, newHpkePub) = _cs.GenerateHpkeKeyPair();
         var currentLeaf = _tree.GetLeaf(_myLeafIndex)!;
+        // OpenMLS valn1210: the UpdatePath leaf node capabilities MUST support all
+        // GroupContext extensions. Merge the leaf's own extension types plus all
+        // GroupContext extension types into the capabilities.
+        var caps = currentLeaf.Capabilities;
+        var requiredExtTypes = currentLeaf.Extensions
+            .Select(e => e.ExtensionType)
+            .Concat(_groupContext.Extensions.Select(e => e.ExtensionType))
+            .Distinct()
+            .ToArray();
+        if (requiredExtTypes.Any(t => !caps.Extensions.Contains(t)))
+        {
+            caps = new Capabilities
+            {
+                Versions = caps.Versions,
+                CipherSuites = caps.CipherSuites,
+                Extensions = caps.Extensions.Union(requiredExtTypes).ToArray(),
+                Proposals = caps.Proposals,
+                Credentials = caps.Credentials
+            };
+        }
+
         var newLeafNode = new LeafNode
         {
             EncryptionKey = newHpkePub,
             SignatureKey = currentLeaf.SignatureKey,
             Credential = currentLeaf.Credential,
-            Capabilities = currentLeaf.Capabilities,
+            Capabilities = caps,
             Source = LeafNodeSource.Commit,
             Extensions = currentLeaf.Extensions
         };
