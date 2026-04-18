@@ -56,8 +56,10 @@ public static class TreeKem
         var directPath = TreeMath.DirectPath(senderLeafIndex, leafCount);
         var copath = TreeMath.Copath(senderLeafIndex, leafCount);
 
-        // RFC 9420 §7.6: Compute filtered direct path — exclude entries whose
-        // copath child has empty resolution (considering added leaves as blank).
+        // RFC 9420 §4.1.2: Compute filtered direct path — exclude entries whose
+        // copath child has empty resolution. Uses FULL resolution per spec.
+        // New members are excluded from HPKE encryption recipients (line 130)
+        // but NOT from path filtering.
         var addedNodeIndices = new HashSet<uint>();
         if (addedLeaves != null)
             foreach (var al in addedLeaves)
@@ -68,8 +70,7 @@ public static class TreeKem
         for (int i = 0; i < directPath.Length; i++)
         {
             var res = tree.Resolution(copath[i]);
-            var encRes = res.Where(n => !addedNodeIndices.Contains(n)).ToList();
-            if (encRes.Count > 0)
+            if (res.Count > 0)
             {
                 filteredDp.Add(directPath[i]);
                 filteredCopath.Add(copath[i]);

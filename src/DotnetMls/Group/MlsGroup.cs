@@ -358,7 +358,10 @@ public sealed class MlsGroup
         var (updatePath, newHpkePriv, commitSecret) = TreeKem.Encap(
             tentativeTree, _myLeafIndex, _cs, newLeafNode, () =>
             {
-                // Compute filtered direct path (same as what Encap uses internally)
+                // Compute filtered direct path: exclude nodes whose copath child
+                // has empty resolution. Uses FULL resolution (including new members)
+                // per RFC 9420 §4.1.2. New members are only excluded from HPKE
+                // encryption recipients, not from path filtering.
                 var dp = TreeMath.DirectPath(_myLeafIndex, tentativeTree.LeafCount);
                 var addedNodeIndices = new HashSet<uint>(addedLeaves.Select(l => TreeMath.LeafToNode(l)));
                 var cp = TreeMath.Copath(_myLeafIndex, tentativeTree.LeafCount);
@@ -366,7 +369,7 @@ public sealed class MlsGroup
                 for (int i = 0; i < dp.Length; i++)
                 {
                     var res = tentativeTree.Resolution(cp[i]);
-                    if (res.Any(n => !addedNodeIndices.Contains(n)))
+                    if (res.Count > 0)
                         fdp.Add(dp[i]);
                 }
 
@@ -829,16 +832,17 @@ public sealed class MlsGroup
             foreach (uint n in senderDp)
                 tentativeTree.SetParent(n, null);
 
-            // RFC 9420 §7.6: Filtered direct path excludes entries whose copath
-            // child has empty resolution (excluding newly added members).
+            // RFC 9420 §4.1.2: Filtered direct path excludes entries whose copath
+            // child has empty resolution. Resolution uses the FULL set of nodes
+            // (including newly added members). New members are only excluded from
+            // the HPKE encryption recipients, not from the path filtering itself.
             var addedNodeIndices = new HashSet<uint>(addedLeaves.Select(l => TreeMath.LeafToNode(l)));
             var filteredDp = new List<uint>();
             var filteredCopath = new List<uint>();
             for (int i = 0; i < senderDp.Length; i++)
             {
                 var res = tentativeTree.Resolution(senderCopath[i]);
-                var encRes = res.Where(n => !addedNodeIndices.Contains(n)).ToList();
-                if (encRes.Count > 0)
+                if (res.Count > 0)
                 {
                     filteredDp.Add(senderDp[i]);
                     filteredCopath.Add(senderCopath[i]);
@@ -1428,16 +1432,20 @@ public sealed class MlsGroup
         var (updatePath, newHpkePriv, commitSecret) = TreeKem.Encap(
             tentativeTree, myLeafIndex, cs, newLeafNode, () =>
             {
+                // External commit: joiner IS the added member. Use encryption
+                // resolution (excluding self) for filtered path since we don't
+                // encrypt to ourselves. This matches the Encap behavior.
                 var dp = TreeMath.DirectPath(myLeafIndex, tentativeTree.LeafCount);
-                var addedNodeIndices = new HashSet<uint> { TreeMath.LeafToNode(myLeafIndex) };
+                var externalAddedNodeIndices = new HashSet<uint> { TreeMath.LeafToNode(myLeafIndex) };
                 var cp = TreeMath.Copath(myLeafIndex, tentativeTree.LeafCount);
                 var fdp = new List<uint>();
                 for (int i = 0; i < dp.Length; i++)
                 {
                     var res = tentativeTree.Resolution(cp[i]);
-                    if (res.Any(n => !addedNodeIndices.Contains(n)))
+                    if (res.Count > 0)
                         fdp.Add(dp[i]);
                 }
+
 
                 for (int i = fdp.Count - 2; i >= 0; i--)
                 {
