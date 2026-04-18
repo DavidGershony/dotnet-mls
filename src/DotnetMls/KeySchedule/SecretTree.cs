@@ -8,8 +8,8 @@ namespace DotnetMls.KeySchedule;
 /// The tree mirrors the ratchet tree topology. The root receives the encryption_secret
 /// from the epoch key schedule. Internal nodes derive left and right children:
 /// <code>
-///   left_secret  = ExpandWithLabel(parent_secret, "tree", [0x00], SecretSize)
-///   right_secret = ExpandWithLabel(parent_secret, "tree", [0x01], SecretSize)
+///   left_secret  = ExpandWithLabel(parent_secret, "tree", "left",  KDF.Nh)
+///   right_secret = ExpandWithLabel(parent_secret, "tree", "right", KDF.Nh)
 /// </code>
 /// Each leaf has two ratchet chains (handshake and application). From a leaf secret:
 /// <code>
@@ -42,6 +42,9 @@ public sealed class SecretTree
     private readonly RatchetState?[] _handshakeRatchets;
     private readonly RatchetState?[] _applicationRatchets;
 
+    // RFC 9420 §9, Figure 25: Secret tree child derivation
+    //   left_secret  = ExpandWithLabel(parent_secret, "tree", "left",  KDF.Nh)
+    //   right_secret = ExpandWithLabel(parent_secret, "tree", "right", KDF.Nh)
     private static readonly byte[] LeftContext = "left"u8.ToArray();
     private static readonly byte[] RightContext = "right"u8.ToArray();
 
