@@ -376,7 +376,7 @@ public sealed class MlsGroup
         // new public keys (Phase 1) but before encryption (Phase 2).
         // Inside the factory, we compute parent hashes, add unmerged leaves for
         // added members, and sign the leaf so the tree hash matches ProcessCommitCore.
-        var (updatePath, newHpkePriv, commitSecret) = TreeKem.Encap(
+        var (updatePath, newHpkePriv, commitSecret, pathSecretsByNode) = TreeKem.Encap(
             tentativeTree, _myLeafIndex, _cs, newLeafNode, () =>
             {
                 // Compute filtered direct path: exclude nodes whose copath child
@@ -520,7 +520,7 @@ public sealed class MlsGroup
         {
             welcome = BuildWelcome(
                 tentativeTree, tentativeContext, newKeySchedule,
-                newMembers, confirmationTag);
+                newMembers, confirmationTag, pathSecretsByNode);
         }
 
         // Store pending commit state
@@ -954,7 +954,9 @@ public sealed class MlsGroup
             uint resNodeIdx = uint.MaxValue;
             for (int i = 0; i < filteredCopath.Count; i++)
             {
-                var resolution = originalTree.Resolution(filteredCopath[i]);
+                // Use tentativeTree (post-proposals) for resolution — the copath was computed
+                // from the tentative tree, so resolution must match that topology.
+                var resolution = tentativeTree.Resolution(filteredCopath[i]);
                 var encResolution = resolution.Where(n => !addedNodeIndices.Contains(n)).ToList();
                 for (int j = 0; j < encResolution.Count; j++)
                 {
@@ -1450,7 +1452,7 @@ public sealed class MlsGroup
 
         var originalTree = tentativeTree.Clone();
 
-        var (updatePath, newHpkePriv, commitSecret) = TreeKem.Encap(
+        var (updatePath, newHpkePriv, commitSecret, _) = TreeKem.Encap(
             tentativeTree, myLeafIndex, cs, newLeafNode, () =>
             {
                 // External commit: joiner IS the added member. Use encryption
@@ -1729,7 +1731,8 @@ public sealed class MlsGroup
         GroupContext groupContext,
         KeyScheduleEpoch keySchedule,
         List<(KeyPackage kp, byte[] initKey)> newMembers,
-        byte[] confirmationTag)
+        byte[] confirmationTag,
+        IReadOnlyDictionary<uint, byte[]>? pathSecretsByNode = null)
     {
         // Build GroupInfo
         // Include the ratchet_tree extension in GroupInfo
@@ -1769,10 +1772,34 @@ public sealed class MlsGroup
         var encryptedSecretsList = new List<EncryptedGroupSecrets>();
         foreach (var (kp, initKey) in newMembers)
         {
+            // RFC 9420 §12.4.3.1: path_secret is the path secret at the common
+            // ancestor of the committer and the new member. This lets the joiner
+            // derive private keys for parent nodes in the tree.
+            byte[]? welcomePathSecret = null;
+            if (pathSecretsByNode != null && pathSecretsByNode.Count > 0)
+            {
+                uint memberLeaf = uint.MaxValue;
+                for (uint li = 0; li < tree.LeafCount; li++)
+                {
+                    var leaf = tree.GetLeaf(li);
+                    if (leaf != null && leaf.SignatureKey.AsSpan().SequenceEqual(kp.LeafNode.SignatureKey))
+                    {
+                        memberLeaf = li;
+                        break;
+                    }
+                }
+                if (memberLeaf != uint.MaxValue)
+                {
+                    uint ancestor = TreeMath.CommonAncestor(_myLeafIndex, memberLeaf);
+                    if (pathSecretsByNode.TryGetValue(ancestor, out var ps))
+                        welcomePathSecret = ps;
+                }
+            }
+
             var groupSecrets = new GroupSecrets
             {
                 JoinerSecret = keySchedule.JoinerSecret,
-                PathSecret = null, // Path secret is for tree reconstruction; omitted for simplicity
+                PathSecret = welcomePathSecret,
                 Psks = Array.Empty<PreSharedKeyId>()
             };
 
