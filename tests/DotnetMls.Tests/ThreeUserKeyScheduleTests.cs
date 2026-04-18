@@ -134,6 +134,29 @@ public class ThreeUserKeyScheduleTests
         _output.WriteLine($"  Epoch: {group.Epoch}");
         _output.WriteLine($"  TreeHash: {Hex(group.GroupContext.TreeHash)}");
         _output.WriteLine($"  Transcript: {Hex(group.GroupContext.ConfirmedTranscriptHash)}");
+        _output.WriteLine($"  Tree ({group.Tree.LeafCount} leaves, {group.Tree.NodeCount} nodes):");
+        for (int i = 0; i < group.Tree.NodeCount; i++)
+        {
+            var node = group.Tree.GetNode((uint)i);
+            if (node is DotnetMls.Tree.TreeNode.Leaf leaf)
+            {
+                if (leaf.Value != null)
+                    _output.WriteLine($"    [{i}] Leaf: sig={Hex(leaf.Value.SignatureKey)[..16]}..., src={leaf.Value.Source}");
+                else
+                    _output.WriteLine($"    [{i}] Leaf: (blank)");
+            }
+            else if (node is DotnetMls.Tree.TreeNode.Parent parent)
+            {
+                if (parent.Value != null)
+                    _output.WriteLine($"    [{i}] Parent: enc={Hex(parent.Value.EncryptionKey)[..16]}..., unmerged=[{string.Join(",", parent.Value.UnmergedLeaves)}], parentHash={Hex(parent.Value.ParentHash)[..Math.Min(16, Hex(parent.Value.ParentHash).Length)]}");
+                else
+                    _output.WriteLine($"    [{i}] Parent: (blank)");
+            }
+            else
+            {
+                _output.WriteLine($"    [{i}] null");
+            }
+        }
         _output.WriteLine("");
     }
 
