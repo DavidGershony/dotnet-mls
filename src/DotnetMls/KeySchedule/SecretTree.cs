@@ -105,6 +105,11 @@ public sealed class SecretTree
 
     /// <summary>
     /// Initializes a new secret tree from the epoch's encryption_secret and the group's leaf count.
+    /// The leaf count is padded to the next power of 2 so that the tree topology is a full
+    /// binary tree with no clamped right-child shortcuts. This matches OpenMLS's behavior
+    /// and ensures cross-implementation interop: without padding, leaves in the right subtree
+    /// of an unbalanced tree get different derivation paths (fewer ExpandWithLabel steps)
+    /// than in a full tree, producing wrong keys.
     /// </summary>
     /// <param name="cs">The cipher suite providing cryptographic primitives.</param>
     /// <param name="encryptionSecret">The encryption_secret derived from the epoch key schedule.</param>
@@ -116,13 +121,15 @@ public sealed class SecretTree
             throw new ArgumentOutOfRangeException(nameof(leafCount), "Leaf count must be at least 1.");
 
         _cs = cs;
-        _leafCount = leafCount;
+        // Pad to the next power of 2 to produce a full binary tree.
+        // This avoids right-child clamping that changes derivation paths.
+        _leafCount = NextPowerOf2(leafCount);
 
-        // A binary tree over N leaves has 2*N - 1 nodes.
-        _nodeCount = (int)(2 * leafCount - 1);
+        // A full binary tree over N leaves has 2*N - 1 nodes.
+        _nodeCount = (int)(2 * _leafCount - 1);
         _nodeSecrets = new byte[]?[_nodeCount];
-        _handshakeRatchets = new RatchetState?[leafCount];
-        _applicationRatchets = new RatchetState?[leafCount];
+        _handshakeRatchets = new RatchetState?[_leafCount];
+        _applicationRatchets = new RatchetState?[_leafCount];
 
         // Place a copy of the encryption_secret at the root.
         // Must clone because EraseSecret will Array.Clear this when deriving children,
@@ -310,6 +317,21 @@ public sealed class SecretTree
             return Parent(p);
         }
         return p;
+    }
+
+    /// <summary>
+    /// Returns the smallest power of 2 that is >= n.
+    /// </summary>
+    private static uint NextPowerOf2(uint n)
+    {
+        if (n <= 1) return 1;
+        n--;
+        n |= n >> 1;
+        n |= n >> 2;
+        n |= n >> 4;
+        n |= n >> 8;
+        n |= n >> 16;
+        return n + 1;
     }
 
     /// <summary>
