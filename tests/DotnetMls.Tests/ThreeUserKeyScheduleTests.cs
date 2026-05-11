@@ -4,7 +4,6 @@ using DotnetMls.Group;
 using DotnetMls.Types;
 using Xunit;
 using Xunit.Abstractions;
-
 namespace DotnetMls.Tests;
 
 /// <summary>
