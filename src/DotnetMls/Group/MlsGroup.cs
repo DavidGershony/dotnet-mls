@@ -571,6 +571,11 @@ public sealed class MlsGroup
     /// </summary>
     public void ClearPendingCommit() => _pendingCommit = null;
 
+    /// <summary>
+    /// Returns true if a pending commit exists that has not yet been merged or cleared.
+    /// </summary>
+    public bool HasPendingCommit => _pendingCommit != null;
+
     // -- Process a received commit --
 
     /// <summary>
